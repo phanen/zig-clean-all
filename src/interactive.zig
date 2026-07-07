@@ -1,216 +1,148 @@
-//! Multi-select TUI built on libvaxis. Mirrors cargo-clean-all's `-i`
-//! behaviour: the user starts with the keep-filter preselection, can
-//! toggle each project with Space, navigate with arrow keys, and
-//! confirms with Enter. Pressing q or Esc cancels without running the
-//! cleanup.
+//! Inline multi-select prompt.
+//!
+//! Mirrors cargo-clean-all's -i ergonomics without an alt-screen TUI:
+//! after the standard "[CLEAN]/[KEEP]" listing prints, the user is
+//! dropped into a small command loop in the same terminal buffer.
+//! They can flip individual rows by number, toggle ranges, flip
+//! everything, or confirm with a blank line. Pressing `q` cancels.
+//!
+//! The frame is rewritten in place after each command via
+//! `\x1b[<n>A` (cursor up) + `\x1b[J` (clear to bottom of screen),
+//! so the prompt stays anchored at the bottom of the terminal and
+//! the user can scroll back through their earlier scan output.
 
 const std = @import("std");
-const vaxis = @import("vaxis");
-const Segment = vaxis.Segment;
 
 const selection = @import("selection.zig");
 const format = @import("format.zig");
 
 const Io = std.Io;
-const Allocator = std.mem.Allocator;
-const Key = vaxis.Key;
-
-const AppEvent = union(enum) {
-    key_press: Key,
-    winsize: vaxis.Winsize,
-};
 
 pub const Result = struct {
     confirmed: bool,
 };
 
-/// Run the interactive multi-select screen. Mutates
-/// `selections[i].selected` in place based on the user's toggles.
-/// Returns whether the user confirmed or cancelled.
-pub fn run(
-    io: Io,
-    env_map: *const std.process.Environ.Map,
-    selections: []selection.Selection,
-    gpa: Allocator,
-) !Result {
-    var buffer: [4096]u8 = undefined;
-    var tty: vaxis.Tty = try .init(io, &buffer);
-    defer tty.deinit();
+const PROMPT =
+    \\toggle (e.g. "1 3 5", "1-3", "a"/"n"; ENTER ok, q cancel):
+;
 
-    var vx = try vaxis.init(io, gpa, @constCast(env_map), .{});
-    defer vx.deinit(gpa, tty.writer());
+/// Run the inline multi-select loop. Mutates `selections[i].selected`
+/// in place. Returns whether the user confirmed or cancelled.
+pub fn run(io: Io, selections: []selection.Selection) !Result {
+    var buf: [4096]u8 = undefined;
+    var out_w = std.Io.File.stdout().writer(io, &buf);
 
-    var loop: vaxis.Loop(AppEvent) = .init(io, &tty, &vx);
-    try loop.start();
-    defer loop.stop();
+    // Frame height = one line per project + a blank separator + the
+    // prompt line. We add one more line for the trailing newline
+    // that `\n` writes after the prompt so the cursor lands at the
+    // bottom of the frame when the user types.
+    const frame_height: u16 = @intCast(selections.len + 3);
 
-    try vx.enterAltScreen(tty.writer());
-    try vx.queryTerminal(tty.writer(), .fromSeconds(1));
-    try vx.queryColor(tty.writer(), .fg);
-    try vx.queryColor(tty.writer(), .bg);
+    try drawFrame(&out_w.interface, selections);
+    try out_w.interface.flush();
 
-    // Block until we have a window size - the screen render depends on it.
     while (true) {
-        const event = try loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| {
-                try vx.resize(gpa, tty.writer(), ws);
-                break;
-            },
-            .key_press => {},
+        var stdin = std.Io.File.stdin();
+        var in_r = stdin.reader(io, &buf);
+        const n = in_r.interface.readSliceShort(&buf) catch return .{ .confirmed = false };
+        if (n == 0) return .{ .confirmed = true };
+        const raw = buf[0..n];
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+
+        if (line.len == 0) return .{ .confirmed = true };
+        if (std.ascii.eqlIgnoreCase(line, "q")) return .{ .confirmed = false };
+        if (std.ascii.eqlIgnoreCase(line, "a")) {
+            for (selections) |*s| s.selected = true;
+        } else if (std.ascii.eqlIgnoreCase(line, "n")) {
+            for (selections) |*s| s.selected = false;
+        } else {
+            applyToggle(selections, line);
         }
+
+        // Move cursor back to the top of the frame and erase
+        // everything from there to the bottom of the screen, then
+        // redraw with the updated toggles.
+        try out_w.interface.print("\x1b[{d}A\x1b[J", .{frame_height});
+        try drawFrame(&out_w.interface, selections);
+        try out_w.interface.flush();
     }
-
-    // Strings allocated for a single frame must outlive the matching
-    // vx.render call: the renderer compares screen_last[i].char.grapheme
-    // (a pointer into last frame's text) against the current cell. If
-    // we free the allocations immediately after printSegment, the
-    // pointer dangles by the time render touches it. Hold every
-    // per-frame allocation in this list and free them at the bottom of
-    // the frame, just before the next iteration reuses the capacity.
-    var frame_allocs: std.ArrayList([]u8) = .empty;
-    defer {
-        for (frame_allocs.items) |s| gpa.free(s);
-        frame_allocs.deinit(gpa);
-    }
-
-    var cursor: usize = 0;
-    var view_top: usize = 0;
-
-    main: while (true) {
-        // Drain pending events.
-        while (try loop.tryEvent()) |event| {
-            switch (event) {
-                .key_press => |key| {
-                    if (key.matches('q', .{}) or
-                        key.matchExact('c', .{ .ctrl = true }) or
-                        key.matches(0x1b, .{}))
-                    {
-                        try vx.exitAltScreen(tty.writer());
-                        return .{ .confirmed = false };
-                    }
-                    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                        if (cursor + 1 < selections.len) cursor += 1;
-                    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                        if (cursor > 0) cursor -= 1;
-                    } else if (key.matches(' ', .{})) {
-                        if (selections.len > 0) {
-                            selections[cursor].selected = !selections[cursor].selected;
-                        }
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
-                        break :main;
-                    }
-                },
-                .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
-            }
-        }
-
-        // Drop previous frame's strings; the new frame will reuse the
-        // list's capacity.
-        for (frame_allocs.items) |s| gpa.free(s);
-        frame_allocs.clearRetainingCapacity();
-
-        const win = vx.window();
-        win.clear();
-
-        const win_height = win.height;
-        const win_width = win.width;
-        // Reserve 2 rows: header at top, footer at bottom.
-        const list_rows: u16 = if (win_height > 2) win_height - 2 else 0;
-
-        // Header.
-        var sel_count: usize = 0;
-        var will_free: u64 = 0;
-        for (selections) |s| {
-            if (s.selected) {
-                sel_count += 1;
-                will_free += s.analysis.total_size_bytes;
-            }
-        }
-        var size_buf: [64]u8 = undefined;
-        const size_str = size_buf[0..format.formatBytes(&size_buf, will_free)];
-
-        const header = try std.fmt.allocPrint(
-            gpa,
-            "zig-clean-all  {d}/{d} selected  will free {s}",
-            .{ sel_count, selections.len, size_str },
-        );
-        try frame_allocs.append(gpa, header);
-        _ = win.printSegment(.{ .text = header }, .{ .row_offset = 0, .col_offset = 0, .wrap = .none });
-
-        // Visible rows slice.
-        if (cursor >= view_top + list_rows) view_top = cursor + 1 - list_rows;
-        if (cursor < view_top) view_top = cursor;
-
-        // Each row is rendered as a single Segment with wrap = .none.
-        // The path is pre-truncated so the size column never wraps onto a
-        // second visual row, and the truncation respects UTF-8 boundaries
-        // so vaxis's grapheme iterator never sees a half-formed codepoint.
-        var row: u16 = 1;
-        var idx: usize = view_top;
-        while (idx < selections.len and row - 1 < list_rows) : (idx += 1) {
-            const is_cursor = idx == cursor;
-            const s = selections[idx];
-            const cursor_marker: u8 = if (is_cursor) '>' else ' ';
-            const check: u8 = if (s.selected) 'x' else ' ';
-
-            var size_buf2: [64]u8 = undefined;
-            const size_text = size_buf2[0..format.formatBytes(&size_buf2, s.analysis.total_size_bytes)];
-
-            const prefix = std.fmt.allocPrint(gpa, "{c} [{c}] ", .{ cursor_marker, check }) catch continue;
-            try frame_allocs.append(gpa, prefix);
-
-            // Reserve space for prefix + "  " + size_text + 1 char slack.
-            const overhead: u16 = @intCast(prefix.len + 2 + size_text.len + 1);
-            const path_budget: usize = if (win_width > overhead) win_width - overhead else 0;
-            const path_display = truncatePath(gpa, s.project.path, path_budget) catch continue;
-            try frame_allocs.append(gpa, path_display);
-
-            const line = std.fmt.allocPrint(
-                gpa,
-                "{s}{s}  {s}",
-                .{ prefix, path_display, size_text },
-            ) catch continue;
-            try frame_allocs.append(gpa, line);
-
-            const seg: Segment = .{
-                .text = line,
-                .style = .{ .bold = is_cursor, .reverse = is_cursor },
-            };
-            _ = win.printSegment(seg, .{
-                .row_offset = row,
-                .col_offset = 0,
-                .wrap = .none,
-            });
-            row += 1;
-        }
-
-        // Footer is a literal, no allocation needed.
-        const footer = "[Space] toggle  [Enter] confirm  [j/k or arrows] move  [q] cancel";
-        _ = win.printSegment(.{ .text = footer, .style = .{ .dim = true } }, .{
-            .row_offset = if (win_height > 0) win_height - 1 else 0,
-            .col_offset = 0,
-            .wrap = .none,
-        });
-
-        try vx.render(tty.writer());
-    }
-
-    try vx.exitAltScreen(tty.writer());
-    return .{ .confirmed = true };
 }
 
-/// Truncate `path` to fit within `budget` bytes. If the path is short
-/// enough, it is returned unchanged (copied). Otherwise the tail is
-/// replaced with "...". The truncation respects UTF-8 character
-/// boundaries so vaxis's grapheme iterator never sees a partial
-/// multi-byte sequence.
-fn truncatePath(gpa: Allocator, path: []const u8, budget: usize) ![]u8 {
-    if (path.len <= budget) return gpa.dupe(u8, path);
-    if (budget < 3) return gpa.dupe(u8, "...");
-    var keep = budget - 3;
-    // Walk back over any UTF-8 continuation bytes (10xxxxxx) so we
-    // don't slice in the middle of a multi-byte codepoint.
-    while (keep > 0 and (path[keep] & 0xC0) == 0x80) : (keep -= 1) {}
-    return std.fmt.allocPrint(gpa, "{s}...", .{path[0..keep]});
+fn drawFrame(w: anytype, selections: []const selection.Selection) !void {
+    for (selections, 1..) |s, idx| {
+        const marker: u8 = if (s.selected) 'x' else ' ';
+        var size_buf: [64]u8 = undefined;
+        const size_text = size_buf[0..format.formatBytes(&size_buf, s.analysis.total_size_bytes)];
+        try w.print("  [{c}] {d:2}. {s}  {s}\n", .{
+            marker,
+            idx,
+            s.project.path,
+            size_text,
+        });
+    }
+    try w.writeAll("\n");
+    try w.writeAll(PROMPT);
+}
+
+/// Parse a command like "1 3 5" or "1-3 7" and toggle the matching
+/// 1-based indices in `selections`. Tokens that don't parse as
+/// positive integers (or as `<n>-<m>` ranges) are silently ignored,
+/// so a stray typo doesn't kill the session.
+fn applyToggle(selections: []selection.Selection, line: []const u8) void {
+    var it = std.mem.tokenizeAny(u8, line, " \t,");
+    while (it.next()) |tok| {
+        if (std.mem.indexOfScalar(u8, tok, '-')) |dash| {
+            const a = std.fmt.parseInt(usize, tok[0..dash], 10) catch continue;
+            const b = std.fmt.parseInt(usize, tok[dash + 1 ..], 10) catch continue;
+            const lo = @min(a, b);
+            const hi = @max(a, b);
+            var k: usize = lo;
+            while (k <= hi) : (k += 1) {
+                if (k >= 1 and k <= selections.len) {
+                    selections[k - 1].selected = !selections[k - 1].selected;
+                }
+            }
+        } else {
+            const n = std.fmt.parseInt(usize, tok, 10) catch continue;
+            if (n >= 1 and n <= selections.len) {
+                selections[n - 1].selected = !selections[n - 1].selected;
+            }
+        }
+    }
+}
+
+test "applyToggle flips individual indices" {
+    var sel: [3]selection.Selection = .{
+        .{ .project = .{ .path = "/a" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/b" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/c" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+    };
+    applyToggle(&sel, "1 3");
+    try std.testing.expect(sel[0].selected);
+    try std.testing.expect(!sel[1].selected);
+    try std.testing.expect(sel[2].selected);
+}
+
+test "applyToggle flips ranges" {
+    var sel: [4]selection.Selection = .{
+        .{ .project = .{ .path = "/a" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/b" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/c" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/d" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+    };
+    applyToggle(&sel, "1-3");
+    try std.testing.expect(sel[0].selected);
+    try std.testing.expect(sel[1].selected);
+    try std.testing.expect(sel[2].selected);
+    try std.testing.expect(!sel[3].selected);
+}
+
+test "applyToggle ignores out-of-range and unparseable tokens" {
+    var sel: [2]selection.Selection = .{
+        .{ .project = .{ .path = "/a" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+        .{ .project = .{ .path = "/b" }, .analysis = .{ .artifact_paths = &.{}, .total_size_bytes = 0, .last_modified_ns = 0 }, .keep = false, .selected = false },
+    };
+    applyToggle(&sel, "99 abc 0");
+    try std.testing.expect(!sel[0].selected);
+    try std.testing.expect(!sel[1].selected);
 }

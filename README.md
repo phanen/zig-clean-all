@@ -33,16 +33,19 @@ zig-clean-all --dry-run ~                  # report only
 zig-clean-all --ignore ~/src/important ~   # mark a subtree as kept
 zig-clean-all --skip ~/.cache --skip ~/src/foreign ~
 zig-clean-all --keep-empty --yes ~/src     # empty dirs instead of removing
-zig-clean-all -i ~                         # TUI multi-select (falls back to y/N)
+zig-clean-all -i ~                         # inline multi-select below the listing
 ```
 
 Sizes accept B, kB, MB, GB, TB (SI, 1000-based) and KiB, MiB, GiB, TiB
 (binary, 1024-based).
 
-`-i` opens an alt-screen checkbox list (built on libvaxis). Space
-toggles, j/k or arrow keys move, Enter confirms, q/Esc cancels. If
-the run can't take over the terminal (CI, redirected stdout) it
-falls back to the standard y/N prompt.
+`-i` drops into an inline prompt that runs in the same terminal
+buffer as the listing above it. Each row is numbered; type `1 3 5`
+or ranges like `1-3` to toggle, `a` to select all, `n` to deselect
+all, a blank line (or `ENTER`) to confirm, `q` to cancel. The frame
+is rewritten in place after each command, so the user can scroll
+back through earlier output. If the prompt can't read from stdin
+(closed pipe) it falls back to the standard y/N.
 
 ## credits
 

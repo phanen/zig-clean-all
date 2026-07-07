@@ -4,23 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const vaxis_dep = b.dependency("vaxis", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const root_module = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/main.zig"),
-        .imports = &.{
-            .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
-        },
-    });
-
     const exe = b.addExecutable(.{
         .name = "zig-clean-all",
-        .root_module = root_module,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/main.zig"),
+        }),
     });
     b.installArtifact(exe);
 
@@ -36,9 +26,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .root_source_file = b.path("src/main.zig"),
-            .imports = &.{
-                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
-            },
         }),
     });
     const test_step = b.step("test", "Run unit tests");

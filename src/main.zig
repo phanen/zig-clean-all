@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
@@ -111,18 +110,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Decide confirmation flow. Either: --interactive (TUI multi-select,
-    // with a y/N fallback if vaxis can't take over the TTY), or a plain
-    // y/N prompt.
+    // Decide confirmation flow. Either: --interactive (inline
+    // multi-select prompt below the listing), or a plain y/N
+    // prompt. Returns whether cleanup should proceed.
     const proceed: bool = blk: {
         if (c.interactive) {
-            // The TUI mutates `selections[i].selected` in place; the
-            // cleaner below then iterates the same slice and picks up
-            // the final intent. If the TUI fails - typical when stdout
-            // is not a TTY, when stdin is closed, etc. - we fall back
-            // to a y/N prompt rather than aborting, so that
-            // `--interactive` works the same in either environment.
-            const fallback = interactive_mod.run(io, init.environ_map, selections, init.gpa);
+            // The prompt mutates `selections[i].selected` in place;
+            // the cleaner below then iterates the same slice and
+            // picks up the final intent.
+            const fallback = interactive_mod.run(io, selections);
             if (fallback) |result| break :blk result.confirmed else |err| {
                 try printErr(io, "--interactive failed ({t}); falling back to y/N\n", .{err});
                 if (c.yes) break :blk true;

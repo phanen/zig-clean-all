@@ -9,7 +9,5 @@
         "README.md",
         ".gitignore",
     },
-    .dependencies = .{
-        .vaxis = .{ .path = "deps/vaxis" },
-    },
+    .dependencies = .{},
 }
