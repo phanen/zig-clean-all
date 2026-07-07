@@ -84,9 +84,6 @@ pub fn main(init: std.process.Init) !void {
 
     const selections = try selection.selectAll(io, arena, c, project_list.items, analyses.items);
 
-    const now_ns: i128 = std.Io.Timestamp.now(io, .real).nanoseconds;
-    try printSelections(io, selections, now_ns);
-
     const will_free: u64 = totalSelected(selections);
     const kept_size: u64 = totalKept(selections);
     if (c.show_summary) {
@@ -96,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
         const kept_str = buf2[0..format.formatBytes(&buf2, kept_size)];
         try printOut(
             io,
-            "\nselected {d}/{d} projects; would free {s}; keeping {s}\n",
+            "selected {d}/{d} projects; would free {s}; keeping {s}\n",
             .{ countSelected(selections), selections.len, freed_str, kept_str },
         );
     }
@@ -118,8 +115,8 @@ pub fn main(init: std.process.Init) !void {
             // The prompt mutates `selections[i].selected` in place;
             // the cleaner below then iterates the same slice and
             // picks up the final intent.
-            const fallback = interactive_mod.run(io, selections);
-            if (fallback) |result| break :blk result.confirmed else |err| {
+            const outcome = interactive_mod.run(io, init.environ_map, selections, init.gpa);
+            if (outcome) |r| break :blk r == .confirm else |err| {
                 try printErr(io, "--interactive failed ({t}); falling back to y/N\n", .{err});
                 if (c.yes) break :blk true;
                 break :blk try confirmPrompt(io);
@@ -172,35 +169,6 @@ fn confirmPrompt(io: std.Io) !bool {
     const n = reader.interface.readSliceShort(&buf) catch return false;
     if (n == 0) return false;
     return buf[0] == 'y' or buf[0] == 'Y';
-}
-
-fn printSelections(io: std.Io, sel: []const selection.Selection, now_ns: i128) !void {
-    var buf_a: [64]u8 = undefined;
-    var buf_b: [64]u8 = undefined;
-    for (sel) |s| {
-        const size_str = buf_a[0..format.formatBytes(&buf_a, s.analysis.total_size_bytes)];
-        if (s.selected) {
-            try printOut(io, "[CLEAN] {s}  {s}\n", .{ s.project.path, size_str });
-        } else {
-            const reason = keepReason(s, now_ns, &buf_b);
-            try printOut(io, "[KEEP ] {s}  {s}  ({s})\n", .{ s.project.path, size_str, reason });
-        }
-    }
-}
-
-fn keepReason(s: selection.Selection, now_ns: i128, buf: []u8) []const u8 {
-    if (s.analysis.artifact_paths.len == 0) {
-        const written = std.fmt.bufPrint(buf, "no artifacts", .{}) catch return "";
-        return written;
-    }
-    var local: [64]u8 = undefined;
-    const age_ns: i128 = if (now_ns > s.analysis.last_modified_ns)
-        now_ns - s.analysis.last_modified_ns
-    else
-        0;
-    const age = local[0..format.formatAge(&local, age_ns)];
-    const written = std.fmt.bufPrint(buf, "last build {s} ago", .{age}) catch return "";
-    return written;
 }
 
 fn countSelected(s: []const selection.Selection) usize {

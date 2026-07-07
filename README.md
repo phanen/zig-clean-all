@@ -39,13 +39,14 @@ zig-clean-all -i ~                         # inline multi-select below the listi
 Sizes accept B, kB, MB, GB, TB (SI, 1000-based) and KiB, MiB, GiB, TiB
 (binary, 1024-based).
 
-`-i` drops into an inline prompt that runs in the same terminal
-buffer as the listing above it. Each row is numbered; type `1 3 5`
-or ranges like `1-3` to toggle, `a` to select all, `n` to deselect
-all, a blank line (or `ENTER`) to confirm, `q` to cancel. The frame
-is rewritten in place after each command, so the user can scroll
-back through earlier output. If the prompt can't read from stdin
-(closed pipe) it falls back to the standard y/N.
+`-i` drops into an inline multi-select TUI that runs in the same
+terminal buffer as the listing above it. The frame is rewritten in
+place after each keypress, so earlier output above stays visible.
+Keys: `space` toggles the current row, `a` selects all, `n` selects
+none, `up`/`down` (or `j`/`k`) move the cursor, `enter` confirms,
+`q` (or `escape`) cancels. If the prompt cannot open `/dev/tty`
+(closed pipe, no controlling terminal) it falls back to the
+standard y/N.
 
 ## credits
 

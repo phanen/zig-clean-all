@@ -196,8 +196,8 @@ pub const usage =
     \\
     \\Options:
     \\  -y, --yes              Skip confirmation before cleaning
-    \\  -i, --interactive      Multi-select screen for which projects to clean
-    \\                         (falls back to y/N if stdout is not a TTY)
+    \\  -i, --interactive      Inline multi-select TUI to toggle projects
+    \\                         (falls back to y/N if not running in a TTY)
     \\  -s, --keep-size <SIZE> Skip projects with artifact size below SIZE
     \\                         (e.g. "10MB", "1GiB"). SI prefixes use 1000,
     \\                         binary prefixes (KiB, MiB, ...) use 1024.
