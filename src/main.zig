@@ -58,19 +58,27 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var analyses: std.ArrayList(analyzer.Analysis) = .empty;
+    var analyzed_paths: std.ArrayList([]const u8) = .empty;
     for (project_list.items) |p| {
         const pdir = cwd.openDir(io, p.path, .{ .iterate = true }) catch |err| {
             try printErr(io, "could not open {s}: {t}\n", .{ p.path, err });
             continue;
         };
         defer pdir.close(io);
-        const a = try analyzer.analyze(io, pdir, p.path, arena);
+        const a = analyzer.analyze(io, pdir, p.path, arena) catch |err| {
+            try printErr(io, "could not analyze {s}: {t}\n", .{ p.path, err });
+            continue;
+        };
+        try analyzed_paths.append(arena, p.path);
         try analyses.append(arena, a);
     }
-    if (analyses.items.len != project_list.items.len) {
-        var trimmed: std.ArrayList(scanner.Project) = .empty;
-        for (project_list.items[0..analyses.items.len]) |p| try trimmed.append(arena, p);
-        project_list = trimmed;
+    // Rewrite `project_list` so its i-th entry is the project that produced
+    // `analyses.items[i]`. Entries that failed to open or analyze are
+    // dropped, matching the analyses list length.
+    if (analyzed_paths.items.len != project_list.items.len) {
+        var realigned: std.ArrayList(scanner.Project) = .empty;
+        for (analyzed_paths.items) |path| try realigned.append(arena, .{ .path = path });
+        project_list = realigned;
     }
 
     const selections = try selection.selectAll(io, arena, c, project_list.items, analyses.items);

@@ -79,21 +79,73 @@ const Measure = struct {
 /// walker deliberately stops at symlinks to avoid loops and double counting.
 /// `arena` backs the walker's internal stack so callers don't need a
 /// long-lived allocator for the duration of the measurement.
+///
+/// I/O errors that bubble up from `walker.next` (for example an
+/// `AccessDenied` deep inside a sub-tree we cannot enter) are swallowed:
+/// the partial measure collected so far is still useful, and a single
+/// unreadable sub-tree should never abort the whole scan.
 fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
-    var walker = try Dir.walkSelectively(dir, arena);
+    var walker = Dir.walkSelectively(dir, arena) catch return;
     defer walker.deinit();
 
-    while (try walker.next(io)) |entry| {
-        if (entry.kind == .sym_link) continue;
-        switch (entry.kind) {
+    while (true) {
+        const entry = walker.next(io) catch return;
+        const unwrapped = entry orelse break;
+        if (unwrapped.kind == .sym_link) continue;
+        switch (unwrapped.kind) {
             .file => {
-                const stat = dir.statFile(io, entry.basename, .{}) catch continue;
+                // Use `unwrapped.dir`, not the outer `dir`: the walker returns
+                // the containing directory of each entry, not the original
+                // root. Without this we'd always stat against the root and
+                // miss every nested file.
+                const stat = unwrapped.dir.statFile(io, unwrapped.basename, .{}) catch continue;
                 out.total_size += stat.size;
                 const ns: i128 = stat.mtime.nanoseconds;
                 if (ns > out.latest_ns) out.latest_ns = ns;
             },
-            .directory => try walker.enter(io, entry),
+            .directory => walker.enter(io, unwrapped) catch continue,
             else => continue,
         }
     }
+}
+
+test "analyze swallows unreadable sub-trees instead of aborting" {
+    // Skip when running as root, because root bypasses mode bits.
+    if (std.posix.geteuid() == 0) return;
+
+    var env: std.Io.Threaded = .init;
+    defer env.deinit();
+    const io = env.ioBasic();
+
+    const fixture_root = "/tmp/zca-analyzer-unreadable";
+    const cwd = Dir.cwd();
+    cwd.deleteTree(io, fixture_root) catch {};
+
+    try cwd.makeDir(io, fixture_root);
+    try cwd.makePath(io, fixture_root ++ "/.zig-cache/locked");
+    try cwd.makePath(io, fixture_root ++ "/.zig-cache/open");
+    {
+        const dir = try cwd.openDir(io, fixture_root ++ "/.zig-cache/open", .{});
+        defer dir.close(io);
+        var file = try dir.openFile(io, "ok.txt", .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "fine");
+    }
+    try std.posix.chmod(fixture_root ++ "/.zig-cache/locked", 0o000);
+
+    defer std.posix.chmod(fixture_root ++ "/.zig-cache/locked", 0o755) catch {};
+    defer cwd.deleteTree(io, fixture_root) catch {};
+
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const pdir = try cwd.openDir(io, fixture_root, .{ .iterate = true });
+    defer pdir.close(io);
+
+    // Must NOT error: the analyzer should report only what it could read
+    // and silently skip the locked sub-tree.
+    const analysis = try analyze(io, pdir, fixture_root, arena);
+    try std.testing.expectEqual(@as(usize, 1), analysis.artifact_paths.len);
+    try std.testing.expect(analysis.total_size_bytes > 0);
 }
