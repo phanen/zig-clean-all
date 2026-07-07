@@ -1,0 +1,13 @@
+.{
+    .name = .zig_clean_all,
+    .fingerprint = 0x826d9df830aba9b8,
+    .version = "0.1.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        ".gitignore",
+    },
+    .dependencies = .{},
+}
