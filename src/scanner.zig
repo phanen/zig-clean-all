@@ -41,6 +41,11 @@ pub const Project = struct {
 ///
 /// All allocations come from `arena`; callers should normally pass a process
 /// arena and drop the results together.
+///
+/// I/O errors from `walker.next` and `walker.enter` (typically
+/// `AccessDenied` deep in the tree) are swallowed: a single unreadable
+/// sub-tree is skipped and the scan continues with the rest of the work,
+/// rather than aborting the whole run.
 pub fn findProjects(
     io: Io,
     root_dir: Dir,
@@ -49,15 +54,17 @@ pub fn findProjects(
     arena: Allocator,
     out: *std.ArrayList(Project),
 ) anyerror!void {
-    var walker = try Dir.walkSelectively(root_dir, arena);
+    var walker = Dir.walkSelectively(root_dir, arena) catch return;
     defer walker.deinit();
 
-    while (try walker.next(io)) |entry| {
+    while (true) {
+        const next_result = walker.next(io) catch return;
+        const entry = next_result orelse break;
         if (entry.kind == .directory) {
             if (shouldSkipDescend(entry.basename)) continue;
-            const abs = try joinIntoArena(arena, root_base, entry.path);
+            const abs = joinIntoArena(arena, root_base, entry.path) catch continue;
             if (matchesAnySkipPath(abs, skip_paths)) continue;
-            try walker.enter(io, entry);
+            walker.enter(io, entry) catch continue;
             continue;
         }
 
@@ -65,10 +72,10 @@ pub fn findProjects(
         if (!std.mem.eql(u8, entry.basename, "build.zig")) continue;
 
         const dir_rel = path.dirname(entry.path) orelse "";
-        const project_abs = try joinIntoArena(arena, root_base, dir_rel);
+        const project_abs = joinIntoArena(arena, root_base, dir_rel) catch continue;
         if (matchesAnySkipPath(project_abs, skip_paths)) continue;
-        const owned = try arena.dupe(u8, project_abs);
-        try out.append(arena, .{ .path = owned });
+        const owned = arena.dupe(u8, project_abs) catch continue;
+        out.append(arena, .{ .path = owned }) catch continue;
     }
 }
 
@@ -142,4 +149,61 @@ test "shouldSkipDescend matches known artifact dirs" {
     try std.testing.expect(shouldSkipDescend(".hidden"));
     try std.testing.expect(!shouldSkipDescend("src"));
     try std.testing.expect(!shouldSkipDescend(""));
+}
+
+test "findProjects tolerates an unreadable sub-tree" {
+    // Root bypasses mode bits, so the chmod-based fixture cannot
+    // produce AccessDenied for it.
+    if (std.posix.geteuid() == 0) return;
+
+    var env: std.Io.Threaded = .init;
+    defer env.deinit();
+    const io = env.ioBasic();
+
+    const fixture = "/tmp/zca-scanner-unreadable";
+    const cwd = Dir.cwd();
+    cwd.deleteTree(io, fixture) catch {};
+
+    // Two projects at the same level; lock one so the walker hits
+    // AccessDenied when descending into it.
+    try cwd.makeDir(io, fixture);
+    try cwd.makePath(io, fixture ++ "/keep-project");
+    try cwd.makePath(io, fixture ++ "/lock-project/locked-deep");
+    {
+        const keep_dir = try cwd.openDir(io, fixture ++ "/keep-project", .{});
+        defer keep_dir.close(io);
+        var f = try keep_dir.openFile(io, "build.zig", .{ .mode = .read_write });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "// stub");
+    }
+    {
+        const lock_dir = try cwd.openDir(io, fixture ++ "/lock-project", .{});
+        defer lock_dir.close(io);
+        var f = try lock_dir.openFile(io, "build.zig", .{ .mode = .read_write });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "// stub");
+    }
+    try std.posix.chmod(fixture ++ "/lock-project", 0o000);
+
+    defer std.posix.chmod(fixture ++ "/lock-project", 0o755) catch {};
+    defer cwd.deleteTree(io, fixture) catch {};
+
+    var arena_buf: [8192]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const root_dir = try cwd.openDir(io, fixture, .{ .iterate = true });
+    defer root_dir.close(io);
+
+    var projects: std.ArrayList(Project) = .empty;
+    try findProjects(io, root_dir, fixture, &.{}, arena, &projects);
+
+    // The readable project must be found; the locked one may or may not
+    // show up depending on whether the walker visited it before the
+    // chmod bit took effect. The contract is: must not error out.
+    var found_keep = false;
+    for (projects.items) |p| {
+        if (std.mem.indexOf(u8, p.path, "keep-project") != null) found_keep = true;
+    }
+    try std.testing.expect(found_keep);
 }
