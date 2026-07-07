@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
+const analyzer = @import("analyzer.zig");
 
 const version = "0.1.0";
 
@@ -56,7 +57,15 @@ pub fn main(init: std.process.Init) !void {
         .{ c.root_dir, projects.items.len },
     );
     for (projects.items) |p| {
-        try printOut(io, "  project: {s}\n", .{p.path});
+        const pdir = cwd.openDir(io, p.path, .{}) catch continue;
+        defer pdir.close(io);
+        const a = try analyzer.analyze(io, pdir, p.path, init.arena.allocator());
+        try printOut(
+            io,
+            "  project: {s} size={d} mtime_ns={d} artifacts={d}\n",
+            .{ p.path, a.total_size_bytes, a.last_modified_ns, a.artifact_paths.len },
+        );
+        for (a.artifact_paths) |ap| try printOut(io, "    artifact: {s}\n", .{ap});
     }
 }
 
