@@ -1,74 +1,43 @@
 # zig-clean-all
 
 Recursively delete Zig build artifacts (`.zig-cache`, `zig-out`, `zig-pkg`)
-across a directory tree, with size and last-modified filters, an interactive
-selection, and a dry-run mode.
+under a given root, with size and last-modified filters, dry-run mode, and
+an interactive y/N confirmation.
 
-Mirrors the ergonomics of `cargo-clean-all` for the Zig toolchain.
+## How it works
 
-## Why
+A walk starting from `DIR` (default `.`) finds every directory that contains
+a `build.zig`; that is the unit of selection. The walker never descends
+into `.zig-cache`, `zig-out`, `zig-pkg`, or any dot-prefixed entry, and
+honours `--skip <path>` by treating the path as a literal prefix match
+against absolute walker output. For each project, an analyzer sums the
+bytes and tracks the latest mtime across the three artifact names. A
+project is then kept (and skipped during cleanup) if any of these holds:
 
-Zig's per-project cache (`.zig-cache`) and output directory (`zig-out`) can
-quickly accumulate to tens of gigabytes across a filesystem. This tool finds
-every Zig project (any directory containing a `build.zig`) under a given root
-and reports - then optionally deletes - those build artifacts.
+- its path is under a `--ignore` root
+- it has none of the three artifact directories
+- its total artifact size is `<= --keep-size`
+- its last-modified time is within `--keep-days` of "now"
 
-## Usage
+Otherwise the project is selected. After an optional confirmation prompt,
+the selected projects' artifact directories are removed (`--keep-empty`
+empties them in place instead). Failures on individual artifacts are
+collected and printed at the end so a partial cleanup never aborts the
+rest of the run.
 
-```sh
-# Scan current directory, list reclaimable space, ask before cleaning.
-zig-clean-all
-
-# Scan ~/src, scan any depth, ignore recently compiled projects.
-zig-clean-all --keep-days 7 ~/src
-
-# Interactive selection: pre-check projects older than 1 day, then let the user toggle.
-zig-clean-all -i --keep-days 1
-
-# Dry run: report only.
-zig-clean-all --dry-run ~
-
-# Skip filesystem trees entirely.
-zig-clean-all --skip ~/src/foreign --skip ~/.cache ~
+```bash
+zig-clean-all                              # scan ".", ask before cleanup
+zig-clean-all ~/src --keep-days 7          # ignore projects compiled this week
+zig-clean-all ~/src --keep-size 10MiB      # only clean projects >= 10 MiB
+zig-clean-all --dry-run ~                  # report only
+zig-clean-all --ignore ~/src/important ~   # mark a subtree as kept
+zig-clean-all --skip ~/.cache --skip ~/src/foreign ~
+zig-clean-all --keep-empty --yes ~/src     # empty dirs instead of removing
 ```
 
-## Flags
+Sizes accept B, kB, MB, GB, TB (SI, 1000-based) and KiB, MiB, GiB, TiB
+(binary, 1024-based).
 
-```
-Usage: zig-clean-all [OPTIONS] [DIR]
+## credits
 
-Arguments:
-  [DIR]  Root directory to scan [default: .]
-
-Options:
-  -y, --yes                Skip confirmation prompt before cleaning
-  -s, --keep-size <SIZE>   Keep projects whose artifact size is below SIZE
-                           (e.g. "10MB", "1GiB"). [default: 0]
-  -d, --keep-days <DAYS>   Keep projects compiled within the last DAYS days
-                           [default: 0]
-      --dry-run            Report but do not delete
-      --ignore <PATH>      Mark projects under PATH as kept (still scanned)
-      --skip <PATH>        Do not even descend into PATH
-      --keep-empty         Remove artifact contents but leave the empty
-                           directory in place
-      --no-summary         Skip the final summary line
-  -h, --help               Print this help
-      --version            Print version
-```
-
-## Targets
-
-`.zig-cache`, `zig-out`, and `zig-pkg` are all considered artifact
-directories. A project is selected for cleanup when at least one of these
-exists and its accumulated size + last-modified time fail to satisfy the
-keep filters.
-
-## Exit codes
-
-- `0` - success (selection cleaned, or nothing to do)
-- `1` - I/O error during scan or delete
-- `2` - invalid CLI arguments
-
-## License
-
-MIT
+* https://github.com/dnlmlr/cargo-clean-all
