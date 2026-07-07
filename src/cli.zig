@@ -19,6 +19,7 @@ pub const Cli = struct {
     skip_paths: []const []const u8 = &.{},
     keep_empty: bool = false,
     show_summary: bool = true,
+    interactive: bool = false,
 };
 
 pub const ParseError = error{
@@ -64,6 +65,8 @@ pub fn parse(
                 cli.keep_empty = true;
             } else if (mem.eql(u8, stripped, "no-summary")) {
                 cli.show_summary = false;
+            } else if (mem.eql(u8, stripped, "interactive")) {
+                cli.interactive = true;
             } else if (mem.eql(u8, stripped, "help")) {
                 help_version = .help;
             } else if (mem.eql(u8, stripped, "version")) {
@@ -100,6 +103,8 @@ pub fn parse(
             } else if (mem.eql(u8, flag, "d")) {
                 const value = try consumeValue(argv, &i);
                 cli.keep_days = try parseU32(value);
+            } else if (mem.eql(u8, flag, "i")) {
+                cli.interactive = true;
             } else if (mem.eql(u8, flag, "h")) {
                 help_version = .help;
             } else {
@@ -191,6 +196,8 @@ pub const usage =
     \\
     \\Options:
     \\  -y, --yes              Skip confirmation before cleaning
+    \\  -i, --interactive      Multi-select screen for which projects to clean
+    \\                         (falls back to y/N if stdout is not a TTY)
     \\  -s, --keep-size <SIZE> Skip projects with artifact size below SIZE
     \\                         (e.g. "10MB", "1GiB"). SI prefixes use 1000,
     \\                         binary prefixes (KiB, MiB, ...) use 1024.
@@ -214,7 +221,19 @@ test "parse defaults" {
     try std.testing.expectEqual(@as(u64, 0), out[0].keep_size_bytes);
     try std.testing.expectEqual(@as(u32, 0), out[0].keep_days);
     try std.testing.expect(out[0].show_summary);
+    try std.testing.expect(!out[0].interactive);
     try std.testing.expectEqual(@as(HelpOrVersion, .neither), out[1]);
+}
+
+test "interactive flag activates" {
+    const arena = std.testing.allocator;
+    const long_argv = [_][]const u8{"--interactive"};
+    const out_long = try parse(arena, &long_argv);
+    try std.testing.expect(out_long[0].interactive);
+
+    const short_argv = [_][]const u8{"-i"};
+    const out_short = try parse(arena, &short_argv);
+    try std.testing.expect(out_short[0].interactive);
 }
 
 test "parse directory and flags" {
