@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
+const selection = @import("selection.zig");
 
 const version = "0.1.0";
 
@@ -20,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return err,
     };
-    const c = parsed[0];
+    var c = parsed[0];
 
     switch (parsed[1]) {
         .help => return printOut(io, "{s}", .{cli.usage}),
@@ -28,45 +29,77 @@ pub fn main(init: std.process.Init) !void {
         .neither => {},
     }
 
+    const arena = init.arena.allocator();
+
     const cwd = std.Io.Dir.cwd();
-    const cwd_path = try std.process.currentPathAlloc(io, init.arena.allocator());
-    const skip_abs = try scanner.resolveSkipPaths(
-        io,
-        cwd_path,
-        c.skip_paths,
-        init.arena.allocator(),
-    );
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
+    const skip_abs = try scanner.resolveSkipPaths(io, cwd_path, c.skip_paths, arena);
+    const ignore_abs = try scanner.resolveSkipPaths(io, cwd_path, c.ignore_paths, arena);
+    c.ignore_paths = ignore_abs;
 
     const root_dir = try cwd.openDir(io, c.root_dir, .{ .iterate = true });
     defer root_dir.close(io);
-    const root_base = try init.arena.allocator().dupe(u8, c.root_dir);
+    const root_base = try arena.dupe(u8, c.root_dir);
 
-    var projects: std.ArrayList(scanner.Project) = .empty;
+    var project_list: std.ArrayList(scanner.Project) = .empty;
     try scanner.findProjects(
         io,
         root_dir,
         root_base,
         skip_abs,
-        init.arena.allocator(),
-        &projects,
+        arena,
+        &project_list,
     );
-
-    try printOut(
-        io,
-        "root={s} projects={d}\n",
-        .{ c.root_dir, projects.items.len },
-    );
-    for (projects.items) |p| {
-        const pdir = cwd.openDir(io, p.path, .{}) catch continue;
-        defer pdir.close(io);
-        const a = try analyzer.analyze(io, pdir, p.path, init.arena.allocator());
-        try printOut(
-            io,
-            "  project: {s} size={d} mtime_ns={d} artifacts={d}\n",
-            .{ p.path, a.total_size_bytes, a.last_modified_ns, a.artifact_paths.len },
-        );
-        for (a.artifact_paths) |ap| try printOut(io, "    artifact: {s}\n", .{ap});
+    if (project_list.items.len == 0) {
+        try printOut(io, "No Zig projects found under {s}\n", .{c.root_dir});
+        return;
     }
+
+    var analyses: std.ArrayList(analyzer.Analysis) = .empty;
+    for (project_list.items) |p| {
+        const pdir = cwd.openDir(io, p.path, .{ .iterate = true }) catch |err| {
+            try printErr(io, "could not open {s}: {t}\n", .{ p.path, err });
+            continue;
+        };
+        defer pdir.close(io);
+        const a = try analyzer.analyze(io, pdir, p.path, arena);
+        try analyses.append(arena, a);
+    }
+
+    // Trim `project_list` to entries that produced an analysis.
+    if (analyses.items.len != project_list.items.len) {
+        var trimmed: std.ArrayList(scanner.Project) = .empty;
+        for (project_list.items[0..analyses.items.len]) |p| try trimmed.append(arena, p);
+        project_list = trimmed;
+    }
+
+    const selections = try selection.selectAll(io, arena, c, project_list.items, analyses.items);
+
+    var will_free: u64 = 0;
+    var kept_size: u64 = 0;
+    for (selections) |s| {
+        if (s.selected) {
+            will_free += s.analysis.total_size_bytes;
+            try printOut(io, "[clean ] {s} ({d} bytes)\n", .{ s.project.path, s.analysis.total_size_bytes });
+        } else {
+            kept_size += s.analysis.total_size_bytes;
+            try printOut(io, "[keep  ] {s} ({d} bytes)\n", .{ s.project.path, s.analysis.total_size_bytes });
+        }
+    }
+    try printOut(io, "\nselected={d} kept={d} will_free={d} kept_size={d}\n", .{
+        countSelected(selections),
+        selections.len - countSelected(selections),
+        will_free,
+        kept_size,
+    });
+}
+
+fn countSelected(s: []const selection.Selection) usize {
+    var n: usize = 0;
+    for (s) |x| {
+        if (x.selected) n += 1;
+    }
+    return n;
 }
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
