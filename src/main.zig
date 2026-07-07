@@ -3,6 +3,7 @@ const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
 const selection = @import("selection.zig");
+const format = @import("format.zig");
 
 const version = "0.1.0";
 
@@ -65,8 +66,6 @@ pub fn main(init: std.process.Init) !void {
         const a = try analyzer.analyze(io, pdir, p.path, arena);
         try analyses.append(arena, a);
     }
-
-    // Trim `project_list` to entries that produced an analysis.
     if (analyses.items.len != project_list.items.len) {
         var trimmed: std.ArrayList(scanner.Project) = .empty;
         for (project_list.items[0..analyses.items.len]) |p| try trimmed.append(arena, p);
@@ -75,23 +74,60 @@ pub fn main(init: std.process.Init) !void {
 
     const selections = try selection.selectAll(io, arena, c, project_list.items, analyses.items);
 
-    var will_free: u64 = 0;
-    var kept_size: u64 = 0;
-    for (selections) |s| {
+    const now_ns: i128 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    try printSelections(io, selections, now_ns);
+
+    const will_free: u64 = totalSelected(selections);
+    const kept_size: u64 = totalKept(selections);
+    if (c.show_summary) {
+        var buf: [128]u8 = undefined;
+        const freed_str = buf[0..format.formatBytes(&buf, will_free)];
+        var buf2: [128]u8 = undefined;
+        const kept_str = buf2[0..format.formatBytes(&buf2, kept_size)];
+        try printOut(
+            io,
+            "\nselected {d}/{d} projects; would free {s}; keeping {s}\n",
+            .{ countSelected(selections), selections.len, freed_str, kept_str },
+        );
+    }
+
+    if (c.dry_run) {
+        try printOut(io, "dry-run: not deleting anything\n", .{});
+        return;
+    }
+    if (countSelected(selections) == 0) {
+        try printOut(io, "Nothing selected to clean.\n", .{});
+        return;
+    }
+}
+
+fn printSelections(io: std.Io, sel: []const selection.Selection, now_ns: i128) !void {
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    for (sel) |s| {
+        const size_str = buf_a[0..format.formatBytes(&buf_a, s.analysis.total_size_bytes)];
         if (s.selected) {
-            will_free += s.analysis.total_size_bytes;
-            try printOut(io, "[clean ] {s} ({d} bytes)\n", .{ s.project.path, s.analysis.total_size_bytes });
+            try printOut(io, "[CLEAN] {s}  {s}\n", .{ s.project.path, size_str });
         } else {
-            kept_size += s.analysis.total_size_bytes;
-            try printOut(io, "[keep  ] {s} ({d} bytes)\n", .{ s.project.path, s.analysis.total_size_bytes });
+            const reason = keepReason(s, now_ns, &buf_b);
+            try printOut(io, "[KEEP ] {s}  {s}  ({s})\n", .{ s.project.path, size_str, reason });
         }
     }
-    try printOut(io, "\nselected={d} kept={d} will_free={d} kept_size={d}\n", .{
-        countSelected(selections),
-        selections.len - countSelected(selections),
-        will_free,
-        kept_size,
-    });
+}
+
+fn keepReason(s: selection.Selection, now_ns: i128, buf: []u8) []const u8 {
+    if (s.analysis.artifact_paths.len == 0) {
+        const written = std.fmt.bufPrint(buf, "no artifacts", .{}) catch return "";
+        return written;
+    }
+    var local: [64]u8 = undefined;
+    const age_ns: i128 = if (now_ns > s.analysis.last_modified_ns)
+        now_ns - s.analysis.last_modified_ns
+    else
+        0;
+    const age = local[0..format.formatAge(&local, age_ns)];
+    const written = std.fmt.bufPrint(buf, "last build {s} ago", .{age}) catch return "";
+    return written;
 }
 
 fn countSelected(s: []const selection.Selection) usize {
@@ -100,6 +136,22 @@ fn countSelected(s: []const selection.Selection) usize {
         if (x.selected) n += 1;
     }
     return n;
+}
+
+fn totalSelected(s: []const selection.Selection) u64 {
+    var total: u64 = 0;
+    for (s) |x| {
+        if (x.selected) total += x.analysis.total_size_bytes;
+    }
+    return total;
+}
+
+fn totalKept(s: []const selection.Selection) u64 {
+    var total: u64 = 0;
+    for (s) |x| {
+        if (!x.selected) total += x.analysis.total_size_bytes;
+    }
+    return total;
 }
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
