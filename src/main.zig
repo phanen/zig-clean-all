@@ -4,6 +4,7 @@ const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
 const selection = @import("selection.zig");
 const format = @import("format.zig");
+const cleaner = @import("cleaner.zig");
 
 const version = "0.1.0";
 
@@ -99,6 +100,53 @@ pub fn main(init: std.process.Init) !void {
         try printOut(io, "Nothing selected to clean.\n", .{});
         return;
     }
+
+    if (!c.yes) {
+        if (!try confirmPrompt(io)) {
+            try printOut(io, "Cleanup cancelled.\n", .{});
+            return;
+        }
+    }
+
+    var selected_paths: std.ArrayList([]const u8) = .empty;
+    for (selections) |s| {
+        if (s.selected) try selected_paths.append(arena, s.project.path);
+    }
+    const summary = try cleaner.cleanAll(
+        io,
+        arena,
+        selected_paths.items,
+        c.keep_empty,
+    );
+
+    var buf: [64]u8 = undefined;
+    const cleaned_str = buf[0..format.formatBytes(&buf, will_free)];
+    if (summary.failed.len == 0) {
+        try printOut(io, "\nCleanup complete. Reclaimed {s} ({d} artifacts removed).\n", .{
+            cleaned_str,
+            summary.removed + summary.emptied,
+        });
+    } else {
+        try printErr(io, "\nCleanup finished with {d} failures. Reclaimed {s}.\n", .{
+            summary.failed.len,
+            cleaned_str,
+        });
+        for (summary.failed) |f| {
+            try printErr(io, "  - {s}/{s}: {t}\n", .{ f.project_path, f.artifact_name, f.err });
+        }
+    }
+}
+
+/// Read a single line from stdin and return true if it starts with 'y' or
+/// 'Y'. Anything else (including EOF) returns false.
+fn confirmPrompt(io: std.Io) !bool {
+    try printOut(io, "Proceed with cleanup? [y/N] ", .{});
+    var buf: [16]u8 = undefined;
+    var stdin = std.Io.File.stdin();
+    var reader = stdin.reader(io, &buf);
+    const n = reader.interface.readSliceShort(&buf) catch return false;
+    if (n == 0) return false;
+    return buf[0] == 'y' or buf[0] == 'Y';
 }
 
 fn printSelections(io: std.Io, sel: []const selection.Selection, now_ns: i128) !void {
