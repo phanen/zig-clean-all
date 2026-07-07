@@ -33,10 +33,16 @@ zig-clean-all --dry-run ~                  # report only
 zig-clean-all --ignore ~/src/important ~   # mark a subtree as kept
 zig-clean-all --skip ~/.cache --skip ~/src/foreign ~
 zig-clean-all --keep-empty --yes ~/src     # empty dirs instead of removing
+zig-clean-all -i ~                         # TUI multi-select (falls back to y/N)
 ```
 
 Sizes accept B, kB, MB, GB, TB (SI, 1000-based) and KiB, MiB, GiB, TiB
 (binary, 1024-based).
+
+`-i` opens an alt-screen checkbox list (built on libvaxis). Space
+toggles, j/k or arrow keys move, Enter confirms, q/Esc cancels. If
+the run can't take over the terminal (CI, redirected stdout) it
+falls back to the standard y/N prompt.
 
 ## credits
 
