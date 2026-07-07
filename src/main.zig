@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const scanner = @import("scanner.zig");
 
 const version = "0.1.0";
 
@@ -26,19 +27,37 @@ pub fn main(init: std.process.Init) !void {
         .neither => {},
     }
 
+    const cwd = std.Io.Dir.cwd();
+    const cwd_path = try std.process.currentPathAlloc(io, init.arena.allocator());
+    const skip_abs = try scanner.resolveSkipPaths(
+        io,
+        cwd_path,
+        c.skip_paths,
+        init.arena.allocator(),
+    );
+
+    const root_dir = try cwd.openDir(io, c.root_dir, .{ .iterate = true });
+    defer root_dir.close(io);
+    const root_base = try init.arena.allocator().dupe(u8, c.root_dir);
+
+    var projects: std.ArrayList(scanner.Project) = .empty;
+    try scanner.findProjects(
+        io,
+        root_dir,
+        root_base,
+        skip_abs,
+        init.arena.allocator(),
+        &projects,
+    );
+
     try printOut(
         io,
-        "root={s} yes={} keep_size={d} keep_days={d} dry_run={} ignore={d} skip={d}\n",
-        .{
-            c.root_dir,
-            c.yes,
-            c.keep_size_bytes,
-            c.keep_days,
-            c.dry_run,
-            c.ignore_paths.len,
-            c.skip_paths.len,
-        },
+        "root={s} projects={d}\n",
+        .{ c.root_dir, projects.items.len },
     );
+    for (projects.items) |p| {
+        try printOut(io, "  project: {s}\n", .{p.path});
+    }
 }
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
