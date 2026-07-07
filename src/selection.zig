@@ -161,3 +161,30 @@ test "selectAll respects ignore paths" {
     try std.testing.expect(out[0].keep);
     try std.testing.expect(!out[0].selected);
 }
+
+test "selectAll sorts results by ascending size" {
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const projects = [_]scanner.Project{
+        .{ .path = "/p/big" },
+        .{ .path = "/p/small" },
+        .{ .path = "/p/mid" },
+    };
+    const analyses = [_]analyzer.Analysis{
+        .{ .artifact_paths = &.{"/p/big"}, .total_size_bytes = 9000, .last_modified_ns = 1 },
+        .{ .artifact_paths = &.{"/p/small"}, .total_size_bytes = 100, .last_modified_ns = 1 },
+        .{ .artifact_paths = &.{"/p/mid"}, .total_size_bytes = 3000, .last_modified_ns = 1 },
+    };
+
+    var env: std.Io.Threaded = .init;
+    defer env.deinit();
+    const io = env.ioBasic();
+
+    const c: cli.Cli = .{};
+    const out = try selectAll(io, arena, c, &projects, &analyses);
+    try std.testing.expectEqualStrings("/p/small", out[0].project.path);
+    try std.testing.expectEqualStrings("/p/mid", out[1].project.path);
+    try std.testing.expectEqualStrings("/p/big", out[2].project.path);
+}

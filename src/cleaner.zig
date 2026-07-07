@@ -147,6 +147,28 @@ fn emptyDir(io: Io, parent: Dir, name: []const u8) anyerror!void {
     }
 }
 
+test "cleanAll no-op on missing artifact directories" {
+    var env: std.Io.Threaded = .init;
+    defer env.deinit();
+    const io = env.ioBasic();
+
+    const fake_root = "/tmp/zca-cleaner-missing";
+    std.Io.Dir.cwd().deleteTree(io, fake_root) catch {};
+    try std.Io.Dir.cwd().makeDir(io, fake_root);
+    try std.Io.Dir.cwd().makePath(io, fake_root ++ "/build.zig.touch");
+
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const paths = [_][]const u8{fake_root};
+    const summary = try cleanAll(io, arena, &paths, false);
+    try std.testing.expectEqual(@as(usize, 0), summary.removed);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed.len);
+
+    std.Io.Dir.cwd().deleteTree(io, fake_root) catch {};
+}
+
 test "emptyDir removes file contents" {
     var env: std.Io.Threaded = .init;
     defer env.deinit();
