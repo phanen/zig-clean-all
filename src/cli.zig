@@ -1,0 +1,300 @@
+//! CLI argument parsing for zig-clean-all.
+//!
+//! Owns no allocations of its own: the caller supplies an arena that backs
+//! the slices in `Cli` (notably `ignore_paths` and `skip_paths`). Parsing is
+//! total and returns `error.InvalidArgument` (or friends) on failure.
+
+const std = @import("std");
+const mem = std.mem;
+
+const Allocator = mem.Allocator;
+
+pub const Cli = struct {
+    root_dir: []const u8 = ".",
+    yes: bool = false,
+    keep_size_bytes: u64 = 0,
+    keep_days: u32 = 0,
+    dry_run: bool = false,
+    ignore_paths: []const []const u8 = &.{},
+    skip_paths: []const []const u8 = &.{},
+    keep_empty: bool = false,
+    show_summary: bool = true,
+};
+
+pub const ParseError = error{
+    InvalidArgument,
+    UnknownFlag,
+    MissingValue,
+    OutOfMemory,
+};
+
+pub const HelpOrVersion = enum { neither, help, version };
+
+/// Parse argv (without the program name). Returns the populated `Cli` plus
+/// a `HelpOrVersion` if `--help`/`-h`/`--version` was seen.
+pub fn parse(
+    arena: Allocator,
+    argv: []const []const u8,
+) ParseError!struct { Cli, HelpOrVersion } {
+    var cli: Cli = .{};
+    var ignore_list: std.ArrayList([]const u8) = .empty;
+    var skip_list: std.ArrayList([]const u8) = .empty;
+    var help_version: HelpOrVersion = .neither;
+
+    var i: usize = 0;
+    var stop_flags = false;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (stop_flags) {
+            cli.root_dir = arg;
+            break;
+        }
+        if (mem.eql(u8, arg, "--")) {
+            stop_flags = true;
+            continue;
+        }
+
+        if (mem.startsWith(u8, arg, "--")) {
+            const stripped = arg[2..];
+            if (mem.eql(u8, stripped, "yes")) {
+                cli.yes = true;
+            } else if (mem.eql(u8, stripped, "dry-run")) {
+                cli.dry_run = true;
+            } else if (mem.eql(u8, stripped, "keep-empty")) {
+                cli.keep_empty = true;
+            } else if (mem.eql(u8, stripped, "no-summary")) {
+                cli.show_summary = false;
+            } else if (mem.eql(u8, stripped, "help")) {
+                help_version = .help;
+            } else if (mem.eql(u8, stripped, "version")) {
+                help_version = .version;
+            } else if (mem.eql(u8, stripped, "ignore")) {
+                const value = try consumeValue(argv, &i);
+                try ignore_list.append(arena, value);
+            } else if (mem.eql(u8, stripped, "skip")) {
+                const value = try consumeValue(argv, &i);
+                try skip_list.append(arena, value);
+            } else if (mem.startsWith(u8, stripped, "keep-size=")) {
+                cli.keep_size_bytes = try parseBytes(stripped["keep-size=".len..]);
+            } else if (mem.eql(u8, stripped, "keep-size")) {
+                const value = try consumeValue(argv, &i);
+                cli.keep_size_bytes = try parseBytes(value);
+            } else if (mem.startsWith(u8, stripped, "keep-days=")) {
+                cli.keep_days = try parseU32(stripped["keep-days=".len..]);
+            } else if (mem.eql(u8, stripped, "keep-days")) {
+                const value = try consumeValue(argv, &i);
+                cli.keep_days = try parseU32(value);
+            } else {
+                return ParseError.UnknownFlag;
+            }
+            continue;
+        }
+
+        if (arg.len > 1 and arg[0] == '-') {
+            const flag = arg[1..];
+            if (mem.eql(u8, flag, "y")) {
+                cli.yes = true;
+            } else if (mem.eql(u8, flag, "s")) {
+                const value = try consumeValue(argv, &i);
+                cli.keep_size_bytes = try parseBytes(value);
+            } else if (mem.eql(u8, flag, "d")) {
+                const value = try consumeValue(argv, &i);
+                cli.keep_days = try parseU32(value);
+            } else if (mem.eql(u8, flag, "h")) {
+                help_version = .help;
+            } else {
+                return ParseError.UnknownFlag;
+            }
+            continue;
+        }
+
+        // Positional argument: directory.
+        cli.root_dir = arg;
+        break;
+    }
+
+    cli.ignore_paths = try ignore_list.toOwnedSlice(arena);
+    cli.skip_paths = try skip_list.toOwnedSlice(arena);
+
+    return .{ cli, help_version };
+}
+
+/// Read the next argv slot, advancing `i` past it. Caller is responsible for
+/// the trailing `: (i += 1)` of the parse loop, so this leaves `i` pointing
+/// at the consumed value.
+fn consumeValue(argv: []const []const u8, i: *usize) ParseError![]const u8 {
+    if (i.* + 1 >= argv.len) return ParseError.MissingValue;
+    i.* += 1;
+    return argv[i.*];
+}
+
+/// Parse a byte size like "10MB", "1GiB", "1024", "2.5GB" into a u64.
+/// Decimal SI prefixes (`kB`, `MB`, ...) use 1000; binary prefixes (`KiB`,
+/// `MiB`, ...) use 1024. Suffixes are case-sensitive for the binary form.
+pub fn parseBytes(text: []const u8) ParseError!u64 {
+    if (text.len == 0) return ParseError.InvalidArgument;
+
+    var split: usize = 0;
+    while (split < text.len and (std.ascii.isDigit(text[split]) or text[split] == '.')) {
+        split += 1;
+    }
+    if (split == 0) return ParseError.InvalidArgument;
+    const number_text = text[0..split];
+    const suffix_text = text[split..];
+
+    const value_f = std.fmt.parseFloat(f64, number_text) catch return ParseError.InvalidArgument;
+    if (value_f < 0) return ParseError.InvalidArgument;
+
+    const multiplier: f64 = switch (suffix_text.len) {
+        0 => 1,
+        1 => if (mem.eql(u8, suffix_text, "B")) 1 else return ParseError.InvalidArgument,
+        2 => blk: {
+            if (mem.eql(u8, suffix_text, "kB")) break :blk 1_000;
+            if (mem.eql(u8, suffix_text, "MB")) break :blk 1_000_000;
+            if (mem.eql(u8, suffix_text, "GB")) break :blk 1_000_000_000;
+            if (mem.eql(u8, suffix_text, "TB")) break :blk 1_000_000_000_000;
+            return ParseError.InvalidArgument;
+        },
+        3 => if (mem.eql(u8, suffix_text, "KiB"))
+            1024
+        else if (mem.eql(u8, suffix_text, "MiB"))
+            1024 * 1024
+        else if (mem.eql(u8, suffix_text, "GiB"))
+            1024 * 1024 * 1024
+        else if (mem.eql(u8, suffix_text, "TiB"))
+            1024 * 1024 * 1024 * 1024
+        else
+            return ParseError.InvalidArgument,
+        else => return ParseError.InvalidArgument,
+    };
+
+    const result_f = value_f * multiplier;
+    if (result_f > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+        return ParseError.InvalidArgument;
+    }
+    return @intFromFloat(result_f);
+}
+
+fn parseU32(text: []const u8) ParseError!u32 {
+    if (text.len == 0) return ParseError.InvalidArgument;
+    return std.fmt.parseInt(u32, text, 10) catch return ParseError.InvalidArgument;
+}
+
+pub const usage =
+    \\Usage: zig-clean-all [OPTIONS] [DIR]
+    \\
+    \\Recursively delete Zig build artifacts (.zig-cache, zig-out, zig-pkg)
+    \\under DIR. Defaults to ".".
+    \\
+    \\Arguments:
+    \\  [DIR]                  Root directory [default: .]
+    \\
+    \\Options:
+    \\  -y, --yes              Skip confirmation before cleaning
+    \\  -s, --keep-size <SIZE> Skip projects with artifact size below SIZE
+    \\                         (e.g. "10MB", "1GiB"). SI prefixes use 1000,
+    \\                         binary prefixes (KiB, MiB, ...) use 1024.
+    \\  -d, --keep-days <DAYS> Skip projects compiled within the last DAYS
+    \\  --dry-run              Report but do not delete
+    \\  --ignore <PATH>        Mark projects under PATH as kept
+    \\  --skip <PATH>          Do not descend into PATH at all
+    \\  --keep-empty           Remove artifact contents but keep the dir
+    \\  --no-summary           Skip the final summary line
+    \\  -h, --help             Show this help
+    \\  --version              Show version
+    \\
+;
+
+test "parse defaults" {
+    const arena = std.testing.allocator;
+    const out = try parse(arena, &.{});
+    try std.testing.expectEqualStrings(".", out[0].root_dir);
+    try std.testing.expect(!out[0].yes);
+    try std.testing.expect(!out[0].dry_run);
+    try std.testing.expectEqual(@as(u64, 0), out[0].keep_size_bytes);
+    try std.testing.expectEqual(@as(u32, 0), out[0].keep_days);
+    try std.testing.expect(out[0].show_summary);
+    try std.testing.expectEqual(@as(HelpOrVersion, .neither), out[1]);
+}
+
+test "parse directory and flags" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{ "--yes", "--keep-days", "7", "-s", "10MB", "/tmp" };
+    const out = try parse(arena, &argv);
+    try std.testing.expectEqualStrings("/tmp", out[0].root_dir);
+    try std.testing.expect(out[0].yes);
+    try std.testing.expectEqual(@as(u32, 7), out[0].keep_days);
+    try std.testing.expectEqual(@as(u64, 10_000_000), out[0].keep_size_bytes);
+}
+
+test "parse size suffixes" {
+    try std.testing.expectEqual(@as(u64, 0), try parseBytes("0"));
+    try std.testing.expectEqual(@as(u64, 1024), try parseBytes("1KiB"));
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), try parseBytes("1MiB"));
+    try std.testing.expectEqual(@as(u64, 10_000_000), try parseBytes("10MB"));
+    try std.testing.expectEqual(@as(u64, 1_500_000_000), try parseBytes("1.5GB"));
+}
+
+test "parse rejects garbage" {
+    try std.testing.expectError(ParseError.InvalidArgument, parseBytes(""));
+    try std.testing.expectError(ParseError.InvalidArgument, parseBytes("abc"));
+    try std.testing.expectError(ParseError.InvalidArgument, parseBytes("10XB"));
+}
+
+test "unknown flag is rejected" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{"--no-such-flag"};
+    try std.testing.expectError(ParseError.UnknownFlag, parse(arena, &argv));
+}
+
+test "missing value is rejected" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{"--keep-size"};
+    try std.testing.expectError(ParseError.MissingValue, parse(arena, &argv));
+}
+
+test "ignore and skip accumulate" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{
+        "--ignore", "a",
+        "--ignore", "b",
+        "--skip",   "c",
+        ".",
+    };
+    const out = try parse(arena, &argv);
+    try std.testing.expectEqual(@as(usize, 2), out[0].ignore_paths.len);
+    try std.testing.expectEqual(@as(usize, 1), out[0].skip_paths.len);
+    try std.testing.expectEqualStrings("a", out[0].ignore_paths[0]);
+    try std.testing.expectEqualStrings(".", out[0].root_dir);
+}
+
+test "--help is detected" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{"--help"};
+    const out = try parse(arena, &argv);
+    try std.testing.expectEqual(@as(HelpOrVersion, .help), out[1]);
+}
+
+test "--version is detected" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{"--version"};
+    const out = try parse(arena, &argv);
+    try std.testing.expectEqual(@as(HelpOrVersion, .version), out[1]);
+}
+
+test "double dash stops flag parsing" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{ "--yes", "--", "--not-a-flag" };
+    const out = try parse(arena, &argv);
+    try std.testing.expect(out[0].yes);
+    try std.testing.expectEqualStrings("--not-a-flag", out[0].root_dir);
+}
+
+test "keep-size and keep-days inline form" {
+    const arena = std.testing.allocator;
+    const argv = [_][]const u8{ "--keep-size=2MiB", "--keep-days=3", "." };
+    const out = try parse(arena, &argv);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), out[0].keep_size_bytes);
+    try std.testing.expectEqual(@as(u32, 3), out[0].keep_days);
+    try std.testing.expectEqualStrings(".", out[0].root_dir);
+}
