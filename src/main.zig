@@ -112,8 +112,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Decide confirmation flow. Either: --interactive (TUI multi-select,
-// with a y/N fallback if vaxis can't take over the TTY), or a plain
-// y/N prompt.
+    // with a y/N fallback if vaxis can't take over the TTY), or a plain
+    // y/N prompt.
     const proceed: bool = blk: {
         if (c.interactive) {
             // The TUI mutates `selections[i].selected` in place; the
