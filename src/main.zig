@@ -42,16 +42,9 @@ pub fn main(init: std.process.Init) !void {
 
     const root_dir = try cwd.openDir(io, opts.root_dir, .{ .iterate = true });
     defer root_dir.close(io);
-    // The parallel scanner reaches into subdirs from arbitrary worker
-    // threads via `Dir.openDirAbsolute`, so `root_base` must be absolute
-    // even when the caller wrote a relative `DIR`. We resolve the cwd
-    // once and `path.join` against `opts.root_dir` here; the serial
-    // walker only used `root_base` as a prefix string for output and
-    // was therefore tolerant of relative input.
-    const root_base = if (path.isAbsolute(opts.root_dir))
-        try arena.dupe(u8, opts.root_dir)
-    else
-        try path.join(arena, &.{ cwd_path, opts.root_dir });
+    // Must be absolute: the parallel walker hands `root_base` to
+    // `Dir.openDirAbsolute` from worker threads, which asserts it.
+    const root_base = try path.resolve(arena, &.{ cwd_path, opts.root_dir });
 
     // Default to nproc, but clamp to u32 max in case some hypothetical host
     // has more than 2^32 cores; falling back to a tiny truncated value

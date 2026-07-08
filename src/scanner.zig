@@ -296,9 +296,8 @@ fn joinIntoArena(arena: Allocator, base: []const u8, rel: []const u8) ![]const u
     return path.join(arena, &.{ base, rel });
 }
 
-/// Resolve each skip path against the current working directory so that
-/// string-based path comparison inside `findProjects` is correct. Absolute
-/// paths are kept verbatim; relative paths are joined with the cwd.
+/// Resolved paths have no trailing separator so `pathIsUnderAny`'s
+/// string prefix check matches consistently.
 pub fn resolveSkipPaths(
     cwd_path: []const u8,
     skip_paths: []const []const u8,
@@ -306,13 +305,7 @@ pub fn resolveSkipPaths(
 ) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     for (skip_paths) |raw| {
-        const resolved = if (path.isAbsolute(raw)) raw else try path.join(arena, &.{ cwd_path, raw });
-        // Strip any trailing path separator so prefix matching is consistent.
-        const trimmed = if (resolved.len > 1 and resolved[resolved.len - 1] == path.sep)
-            resolved[0 .. resolved.len - 1]
-        else
-            resolved;
-        try list.append(arena, trimmed);
+        try list.append(arena, try path.resolve(arena, &.{ cwd_path, raw }));
     }
     return try list.toOwnedSlice(arena);
 }
@@ -354,6 +347,49 @@ test "pathIsUnderAny excludes nested dirs" {
     try std.testing.expect(pathIsUnderAny("/data/skip/sub/inner", &skips));
     try std.testing.expect(!pathIsUnderAny("/data/keep", &skips));
     try std.testing.expect(!pathIsUnderAny("/data/skippy", &skips));
+}
+
+test "resolveSkipPaths keeps absolute paths normalised" {
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const raw = [_][]const u8{"/abs/path", "/abs/trailing/"};
+    const got = try resolveSkipPaths("/test/cwd", &raw, arena);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqualStrings("/abs/path", got[0]);
+    try std.testing.expectEqualStrings("/abs/trailing", got[1]);
+}
+
+test "resolveSkipPaths joins relative paths with cwd" {
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const raw = [_][]const u8{"foo", "nested/bar"};
+    const got = try resolveSkipPaths("/test/cwd", &raw, arena);
+    try std.testing.expectEqualStrings("/test/cwd/foo", got[0]);
+    try std.testing.expectEqualStrings("/test/cwd/nested/bar", got[1]);
+}
+
+test "resolveSkipPaths collapses dot-dot and strips trailing separator" {
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const raw = [_][]const u8{"./foo/../bar/", "extra/"};
+    const got = try resolveSkipPaths("/test/cwd", &raw, arena);
+    try std.testing.expectEqualStrings("/test/cwd/bar", got[0]);
+    try std.testing.expectEqualStrings("/test/cwd/extra", got[1]);
+}
+
+test "resolveSkipPaths returns empty for empty input" {
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
+
+    const got = try resolveSkipPaths("/test/cwd", &.{}, arena);
+    try std.testing.expectEqual(@as(usize, 0), got.len);
 }
 
 test "shouldSkipDescend matches known artifact dirs" {
