@@ -1,4 +1,5 @@
 const std = @import("std");
+const path = std.fs.path;
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
@@ -41,10 +42,37 @@ pub fn main(init: std.process.Init) !void {
 
     const root_dir = try cwd.openDir(io, opts.root_dir, .{ .iterate = true });
     defer root_dir.close(io);
-    const root_base = try arena.dupe(u8, opts.root_dir);
+    // The parallel scanner reaches into subdirs from arbitrary worker
+    // threads via `Dir.openDirAbsolute`, so `root_base` must be absolute
+    // even when the caller wrote a relative `DIR`. We resolve the cwd
+    // once and `path.join` against `opts.root_dir` here; the serial
+    // walker only used `root_base` as a prefix string for output and
+    // was therefore tolerant of relative input.
+    const root_base = if (path.isAbsolute(opts.root_dir))
+        try arena.dupe(u8, opts.root_dir)
+    else
+        try path.join(arena, &.{ cwd_path, opts.root_dir });
+
+    const num_threads: u32 = if (opts.threads == 0)
+        @intCast(std.Thread.getCpuCount() catch 1)
+    else
+        opts.threads;
+
+    // The Threaded Io backend defaults its `async_limit` to `nproc - 1` so
+    // there is always at least one CPU left for the main thread. Spawning
+    // more workers than that limit causes the over-the-limit calls to run
+    // eagerly on the caller thread, which can deadlock when the worker
+    // parks in a blocking `getOne` before any job has been enqueued. Lift
+    // the limit to match `num_threads` plus a small slack for the main
+    // thread and any unrelated async work. The cast is safe because the
+    // juicy-main `init.io` is always backed by `std.Io.Threaded`.
+    {
+        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata));
+        threaded.setAsyncLimit(.limited(num_threads + 1));
+    }
 
     var found: std.ArrayList(scanner.Project) = .empty;
-    try scanner.findProjects(io, root_dir, root_base, skip_abs, arena, &found);
+    try scanner.findProjects(io, root_dir, root_base, skip_abs, arena, &found, num_threads);
     if (found.items.len == 0) {
         try printOut(io, "No Zig projects found under {s}\n", .{opts.root_dir});
         return;

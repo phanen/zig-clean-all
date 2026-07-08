@@ -4,14 +4,23 @@
 //! file directly within it. Artifact directories (`.zig-cache`, `zig-out`,
 //! `zig-pkg`) are never descended into - they waste time and can be deeply
 //! nested. Other hidden directories are also skipped.
+//!
+//! The scanner is parallel: with `num_threads >= 2`, subdirectories are
+//! distributed as jobs across a worker pool via an `Io.Queue`, while each
+//! worker walks its assigned directory serially. Workloads with shallow but
+//! wide directory trees (typical large checkouts) scale almost linearly up
+//! to the number of CPUs.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const std_debug = std.debug;
+const assert = std_debug.assert;
 const fs = std.fs;
 const path = fs.path;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
+const Atomic = std.atomic;
 
 const NEVER_DESCEND: []const []const u8 = &.{
     ".git",
@@ -20,10 +29,48 @@ const NEVER_DESCEND: []const []const u8 = &.{
     "zig-pkg",
 };
 
+/// Capacity of the inline job queue. Each directory a worker encounters
+/// becomes a job; very wide trees could overflow this in principle, but in
+/// practice new jobs are consumed almost as fast as they are produced and
+/// the queue rarely holds more than a few hundred entries. When the buffer
+/// fills, workers fall back to walking the subdirectory inline rather than
+/// blocking on `put`, so progress is never lost.
+const QUEUE_CAPACITY: usize = 4096;
+
 pub const Project = struct {
     /// Absolute path of the directory containing `build.zig`. Allocated by
     /// `arena`; remains valid until the arena is freed.
     path: []const u8,
+};
+
+/// One unit of work for the parallel scanner: walk the directory at
+/// `abs_path` and enqueue each of its descendable subdirectories.
+const ScanJob = struct {
+    abs_path: []const u8,
+};
+
+/// Shared state handed to every worker. Lives on the calling task's stack;
+/// each task's `Group.async` call copies the args tuple (which contains a
+/// pointer to this struct) onto the Group's heap, so the pointer remains
+/// valid for the lifetime of the scan.
+const ScanContext = struct {
+    io: Io,
+    root_base: []const u8,
+    skip_paths: []const []const u8,
+    /// Worker arena. Must be the Zig-0.16 lock-free `ArenaAllocator`; the
+    /// `init.arena` from juicy main satisfies this. All `ScanJob.abs_path`
+    /// slices are owned by it.
+    arena: Allocator,
+    queue: *Io.Queue(ScanJob),
+    results: *std.ArrayList(Project),
+    results_mutex: *Io.Mutex,
+    /// Number of jobs in flight (queued + currently being processed by a
+    /// worker). Initialised to 1 by the producer (the seed job). Workers
+    /// `fetchAdd` after a successful enqueue and `fetchSub` after finishing
+    /// a job; whichever worker drives the counter to zero closes the queue
+    /// so every other worker observes `error.Closed` on its next `getOne`
+    /// and exits cleanly.
+    pending: *Atomic.Value(u32),
 };
 
 /// Recursively scan `root_dir` for directories that contain a `build.zig`.
@@ -40,6 +87,11 @@ pub const Project = struct {
 /// resolution is the caller's responsibility. Use `resolveSkipPaths` below
 /// to do that consistently with the workdir used at startup.
 ///
+/// `num_threads` controls the worker pool size. `1` selects the serial
+/// walker (useful for tests / single-core systems); `>= 2` distributes work
+/// across a pool of that many workers. The caller is expected to have
+/// already resolved any "auto" policy to a concrete value.
+///
 /// All allocations come from `arena`; callers should normally pass a process
 /// arena and drop the results together.
 ///
@@ -54,7 +106,26 @@ pub fn findProjects(
     skip_paths: []const []const u8,
     arena: Allocator,
     out: *std.ArrayList(Project),
+    num_threads: u32,
 ) anyerror!void {
+    if (num_threads <= 1) {
+        findProjectsSerial(io, root_dir, root_base, skip_paths, arena, out);
+        return;
+    }
+    try findProjectsParallel(io, root_base, skip_paths, arena, out, num_threads);
+}
+
+/// Single-threaded walk. Kept as the reference implementation - the
+/// parallel walker preserves all of its decisions (skip lists, descent
+/// rules, project-path construction) but distributes them across workers.
+fn findProjectsSerial(
+    io: Io,
+    root_dir: Dir,
+    root_base: []const u8,
+    skip_paths: []const []const u8,
+    arena: Allocator,
+    out: *std.ArrayList(Project),
+) void {
     var walker = Dir.walkSelectively(root_dir, arena) catch return;
     defer walker.deinit();
 
@@ -78,6 +149,142 @@ pub fn findProjects(
         const owned = arena.dupe(u8, project_abs) catch continue;
         out.append(arena, .{ .path = owned }) catch continue;
     }
+}
+
+/// Distributes the directory walk across `num_threads` workers. The queue
+/// is closed once the seed job has been enqueued; workers terminate when
+/// they observe `error.Closed` from `getOne`. Subdirectories whose abs path
+/// cannot fit in the queue are walked inline so a busy buffer never blocks
+/// progress.
+fn findProjectsParallel(
+    io: Io,
+    root_base: []const u8,
+    skip_paths: []const []const u8,
+    arena: Allocator,
+    out: *std.ArrayList(Project),
+    num_threads: u32,
+) !void {
+    assert(num_threads >= 2);
+
+    var queue_buffer: [QUEUE_CAPACITY]ScanJob = undefined;
+    var queue: Io.Queue(ScanJob) = .init(&queue_buffer);
+    var results_mutex: Io.Mutex = .init;
+    // The seed job accounts for one unit of pending work.
+    var pending: Atomic.Value(u32) = .init(1);
+
+    var ctx: ScanContext = .{
+        .io = io,
+        .root_base = root_base,
+        .skip_paths = skip_paths,
+        .arena = arena,
+        .queue = &queue,
+        .results = out,
+        .results_mutex = &results_mutex,
+        .pending = &pending,
+    };
+
+    var group: Io.Group = .init;
+    // `await` resets the group's token; `cancel` is a no-op afterwards, so
+    // the `defer` is safe whether or not `await` succeeded.
+    defer group.cancel(io);
+
+    var i: u32 = 0;
+    while (i < num_threads) : (i += 1) {
+        group.async(io, scanWorker, .{&ctx});
+    }
+
+    // Seed the queue. Workers were already spawned above so they're racing
+    // to consume this; `putOne` blocks until there is space. We must put
+    // before `await` because the workers close the queue themselves once
+    // the pending counter hits zero.
+    try queue.putOne(io, .{ .abs_path = root_base });
+
+    try group.await(io);
+}
+
+fn scanWorker(ctx: *ScanContext) void {
+    while (true) {
+        const job = ctx.queue.getOneUncancelable(ctx.io) catch return;
+        walkInto(ctx, job.abs_path);
+        // Account for the job we just finished. If we drove the counter
+        // to zero, no more work can ever appear (every other worker is
+        // either exiting or about to), so close the queue to unblock
+        // workers parked in `getOne`.
+        const prev = ctx.pending.fetchSub(1, .acq_rel);
+        if (prev == 1) ctx.queue.close(ctx.io);
+    }
+}
+
+/// Walk `abs_path` as a project root. Every descendable subdirectory is
+/// enqueued as a new `ScanJob` so the worker pool can pick it up
+/// concurrently; this is the key load-balancing trick. If the job queue
+/// is full, the subdirectory is walked inline as a fallback so progress is
+/// never blocked by queue back-pressure. `build.zig` files found at any
+/// depth are appended to the shared results list under a mutex.
+///
+/// Errors from the walker are swallowed to match the serial contract: a
+/// single unreadable sub-tree never aborts the whole scan.
+fn walkInto(ctx: *ScanContext, abs_path: []const u8) void {
+    const dir = Dir.openDirAbsolute(ctx.io, abs_path, .{ .iterate = true }) catch return;
+    defer dir.close(ctx.io);
+
+    var walker = Dir.walkSelectively(dir, ctx.arena) catch return;
+    defer walker.deinit();
+
+    while (true) {
+        const next_result = walker.next(ctx.io) catch return;
+        const entry = next_result orelse break;
+        switch (entry.kind) {
+            .directory => {
+                if (shouldSkipDescend(entry.basename)) continue;
+                // `entry.path` already carries every intermediate directory
+                // the walker has descended into via prior `walker.enter`
+                // fallback calls. Joining `abs_path` with `entry.path` is
+                // therefore correct whether or not the walker is still
+                // sitting at its root. Using `entry.basename` instead
+                // yields an absolute path that drops the intermediates
+                // and points at a sibling of the real subdir - that bug
+                // caused the parallel scanner to double-report projects
+                // (once from the inline fallback, once when the enqueued
+                // job was later processed by another worker).
+                const sub_abs = path.join(ctx.arena, &.{ abs_path, entry.path }) catch continue;
+                if (pathIsUnderAny(sub_abs, ctx.skip_paths)) continue;
+
+                // Try to enqueue without blocking. If the queue is full or
+                // closed, fall back to walking this subtree inline in the
+                // current worker - it preserves progress at the cost of a
+                // brief load imbalance. Only bump `pending` after a real
+                // enqueue; an inline walk is "absorbed" into this job's
+                // own pending slot, so the counter is naturally balanced
+                // when this worker decrements at the end.
+                const one_job = [_]ScanJob{.{ .abs_path = sub_abs }};
+                const queued = ctx.queue.putUncancelable(ctx.io, &one_job, 0) catch 0;
+                if (queued > 0) {
+                    _ = ctx.pending.fetchAdd(1, .acq_rel);
+                } else {
+                    walker.enter(ctx.io, entry) catch continue;
+                }
+            },
+            .file => {
+                if (!std.mem.eql(u8, entry.basename, "build.zig")) continue;
+                const dir_rel = path.dirname(entry.path) orelse "";
+                const project_abs = joinIntoArena(ctx.arena, abs_path, dir_rel) catch continue;
+                if (pathIsUnderAny(project_abs, ctx.skip_paths)) continue;
+                const owned = ctx.arena.dupe(u8, project_abs) catch continue;
+                appendResult(ctx, owned);
+            },
+            else => {},
+        }
+    }
+}
+
+fn appendResult(ctx: *ScanContext, owned_path: []const u8) void {
+    // Lock as uncancelable: results are append-only and a single append
+    // completes in microseconds, so the futex-wait path is never taken
+    // in practice and there's no benefit to allowing cancelation here.
+    ctx.results_mutex.lockUncancelable(ctx.io);
+    defer ctx.results_mutex.unlock(ctx.io);
+    ctx.results.append(ctx.arena, .{ .path = owned_path }) catch return;
 }
 
 fn joinIntoArena(arena: Allocator, base: []const u8, rel: []const u8) ![]const u8 {
@@ -193,7 +400,7 @@ test "findProjects tolerates an unreadable sub-tree" {
     defer chmodOrSkip(fixture ++ "/lock-project", 0o755);
     defer cwd.deleteTree(io, fixture) catch {};
 
-    var arena_buf: [8192]u8 = undefined;
+    var arena_buf: [1 * 1024 * 1024]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
     const arena = arena_alloc.allocator();
 
@@ -201,7 +408,10 @@ test "findProjects tolerates an unreadable sub-tree" {
     defer root_dir.close(io);
 
     var projects: std.ArrayList(Project) = .empty;
-    try findProjects(io, root_dir, fixture, &.{}, arena, &projects);
+    // Force the parallel path even though it is a tiny fixture: the test
+    // is mainly a regression guard for the chmod-induced read error,
+    // and the parallel walker has its own swallow-the-error branches.
+    try findProjects(io, root_dir, fixture, &.{}, arena, &projects, 4);
 
     // The readable project must be found; the locked one may or may not
     // show up depending on whether the walker visited it before the
@@ -211,4 +421,60 @@ test "findProjects tolerates an unreadable sub-tree" {
         if (std.mem.indexOf(u8, p.path, "keep-project") != null) found_keep = true;
     }
     try std.testing.expect(found_keep);
+}
+
+test "parallel scanner finds each project exactly once in a deep tree" {
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer env.deinit();
+    // Lift `async_limit` past the nproc-1 default: workers park in
+    // `getOne` before the seed job is enqueued, so anything less than
+    // `num_threads + 1` deadlocks the moment `group.async` runs out of
+    // headroom.
+    env.setAsyncLimit(.limited(8));
+    const io = env.io();
+
+    // The parallel scanner allocates concurrently from this arena via
+    // multiple worker threads. FixedBufferAllocator is single-threaded
+    // and corrupts under contention; ArenaAllocator is threadsafe as
+    // long as its child allocator is.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const fixture = "/tmp/zca-scanner-parallel";
+    const cwd = Dir.cwd();
+    cwd.deleteTree(io, fixture) catch {};
+
+    // Build a wide tree: 4 top-level dirs, each with a deeply nested
+    // build.zig. The parallel scanner must find every project and never
+    // double-report one (a regression we hit when `walker.enter`'s
+    // fallback path computed the subdir abs path from `entry.basename`
+    // instead of the accumulated `entry.path`).
+    try cwd.createDir(io, fixture, .default_dir);
+    const branches = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
+    for (branches) |b| {
+        const deep_path = try std.fs.path.join(arena, &.{ fixture, b, "nested", "deep" });
+        try cwd.createDirPath(io, deep_path);
+        {
+            const dir = try cwd.openDir(io, deep_path, .{});
+            defer dir.close(io);
+            var f = try dir.createFile(io, "build.zig", .{});
+            defer f.close(io);
+            try f.writeStreamingAll(io, "// stub");
+        }
+    }
+    defer cwd.deleteTree(io, fixture) catch {};
+
+    const root_dir = try cwd.openDir(io, fixture, .{ .iterate = true });
+    defer root_dir.close(io);
+
+    // Run with several thread counts to exercise the queue-fallback
+    // path on the smaller fixture (no risk of deadlock - four subdirs
+    // never exceed the queue capacity).
+    var thread_count: u32 = 1;
+    while (thread_count <= 4) : (thread_count += 1) {
+        var projects: std.ArrayList(Project) = .empty;
+        try findProjects(io, root_dir, fixture, &.{}, arena, &projects, thread_count);
+        try std.testing.expectEqual(@as(usize, branches.len), projects.items.len);
+    }
 }

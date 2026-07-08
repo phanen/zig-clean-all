@@ -20,6 +20,9 @@ pub const Cli = struct {
     keep_empty: bool = false,
     show_summary: bool = true,
     interactive: bool = false,
+    /// Number of worker threads to use for the parallel scanner. `0` means
+    /// auto-select based on CPU count.
+    threads: u32 = 0,
 };
 
 pub const ParseError = error{
@@ -100,6 +103,10 @@ pub fn parse(
                 cli.keep_days = try parseU32(stripped["keep-days=".len..]);
             } else if (mem.eql(u8, stripped, "keep-days")) {
                 cli.keep_days = try parseU32(try consumeValue(argv, &i));
+            } else if (mem.startsWith(u8, stripped, "threads=")) {
+                cli.threads = try parseU32(stripped["threads=".len..]);
+            } else if (mem.eql(u8, stripped, "threads")) {
+                cli.threads = try parseU32(try consumeValue(argv, &i));
             } else {
                 return ParseError.UnknownFlag;
             }
@@ -118,6 +125,8 @@ pub fn parse(
                 cli.interactive = true;
             } else if (mem.eql(u8, flag, "h")) {
                 help_version = .help;
+            } else if (mem.eql(u8, flag, "t")) {
+                cli.threads = try parseU32(try consumeValue(argv, &i));
             } else {
                 return ParseError.UnknownFlag;
             }
@@ -203,6 +212,8 @@ pub const usage =
     \\  --skip <PATH>          Do not descend into PATH at all
     \\  --keep-empty           Remove artifact contents but keep the dir
     \\  --no-summary           Skip the final summary line
+    \\  -t, --threads <N>      Worker threads for the parallel scanner
+    \\                         (0 = auto, default 0)
     \\  -h, --help             Show this help
     \\  --version              Show version
     \\
