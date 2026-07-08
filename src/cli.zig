@@ -31,6 +31,23 @@ pub const ParseError = error{
 
 pub const HelpOrVersion = enum { neither, help, version };
 
+const Suffix = struct {
+    text: []const u8,
+    multiplier: u64,
+};
+
+const SIZE_SUFFIXES: []const Suffix = &.{
+    .{ .text = "B", .multiplier = 1 },
+    .{ .text = "kB", .multiplier = 1_000 },
+    .{ .text = "MB", .multiplier = 1_000_000 },
+    .{ .text = "GB", .multiplier = 1_000_000_000 },
+    .{ .text = "TB", .multiplier = 1_000_000_000_000 },
+    .{ .text = "KiB", .multiplier = 1024 },
+    .{ .text = "MiB", .multiplier = 1024 * 1024 },
+    .{ .text = "GiB", .multiplier = 1024 * 1024 * 1024 },
+    .{ .text = "TiB", .multiplier = 1024 * 1024 * 1024 * 1024 },
+};
+
 /// Parse argv (without the program name). Returns the populated `Cli` plus
 /// a `HelpOrVersion` if `--help`/`-h`/`--version` was seen.
 pub fn parse(
@@ -72,21 +89,17 @@ pub fn parse(
             } else if (mem.eql(u8, stripped, "version")) {
                 help_version = .version;
             } else if (mem.eql(u8, stripped, "ignore")) {
-                const value = try consumeValue(argv, &i);
-                try ignore_list.append(arena, value);
+                try ignore_list.append(arena, try consumeValue(argv, &i));
             } else if (mem.eql(u8, stripped, "skip")) {
-                const value = try consumeValue(argv, &i);
-                try skip_list.append(arena, value);
+                try skip_list.append(arena, try consumeValue(argv, &i));
             } else if (mem.startsWith(u8, stripped, "keep-size=")) {
                 cli.keep_size_bytes = try parseBytes(stripped["keep-size=".len..]);
             } else if (mem.eql(u8, stripped, "keep-size")) {
-                const value = try consumeValue(argv, &i);
-                cli.keep_size_bytes = try parseBytes(value);
+                cli.keep_size_bytes = try parseBytes(try consumeValue(argv, &i));
             } else if (mem.startsWith(u8, stripped, "keep-days=")) {
                 cli.keep_days = try parseU32(stripped["keep-days=".len..]);
             } else if (mem.eql(u8, stripped, "keep-days")) {
-                const value = try consumeValue(argv, &i);
-                cli.keep_days = try parseU32(value);
+                cli.keep_days = try parseU32(try consumeValue(argv, &i));
             } else {
                 return ParseError.UnknownFlag;
             }
@@ -98,11 +111,9 @@ pub fn parse(
             if (mem.eql(u8, flag, "y")) {
                 cli.yes = true;
             } else if (mem.eql(u8, flag, "s")) {
-                const value = try consumeValue(argv, &i);
-                cli.keep_size_bytes = try parseBytes(value);
+                cli.keep_size_bytes = try parseBytes(try consumeValue(argv, &i));
             } else if (mem.eql(u8, flag, "d")) {
-                const value = try consumeValue(argv, &i);
-                cli.keep_days = try parseU32(value);
+                cli.keep_days = try parseU32(try consumeValue(argv, &i));
             } else if (mem.eql(u8, flag, "i")) {
                 cli.interactive = true;
             } else if (mem.eql(u8, flag, "h")) {
@@ -147,33 +158,17 @@ pub fn parseBytes(text: []const u8) ParseError!u64 {
     const number_text = text[0..split];
     const suffix_text = text[split..];
 
+    const multiplier: u64 = blk: {
+        for (SIZE_SUFFIXES) |s| {
+            if (mem.eql(u8, suffix_text, s.text)) break :blk s.multiplier;
+        }
+        return ParseError.InvalidArgument;
+    };
+
     const value_f = std.fmt.parseFloat(f64, number_text) catch return ParseError.InvalidArgument;
     if (value_f < 0) return ParseError.InvalidArgument;
 
-    const multiplier: f64 = switch (suffix_text.len) {
-        0 => 1,
-        1 => if (mem.eql(u8, suffix_text, "B")) 1 else return ParseError.InvalidArgument,
-        2 => blk: {
-            if (mem.eql(u8, suffix_text, "kB")) break :blk 1_000;
-            if (mem.eql(u8, suffix_text, "MB")) break :blk 1_000_000;
-            if (mem.eql(u8, suffix_text, "GB")) break :blk 1_000_000_000;
-            if (mem.eql(u8, suffix_text, "TB")) break :blk 1_000_000_000_000;
-            return ParseError.InvalidArgument;
-        },
-        3 => if (mem.eql(u8, suffix_text, "KiB"))
-            1024
-        else if (mem.eql(u8, suffix_text, "MiB"))
-            1024 * 1024
-        else if (mem.eql(u8, suffix_text, "GiB"))
-            1024 * 1024 * 1024
-        else if (mem.eql(u8, suffix_text, "TiB"))
-            1024 * 1024 * 1024 * 1024
-        else
-            return ParseError.InvalidArgument,
-        else => return ParseError.InvalidArgument,
-    };
-
-    const result_f = value_f * multiplier;
+    const result_f = value_f * @as(f64, @floatFromInt(multiplier));
     if (result_f > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
         return ParseError.InvalidArgument;
     }

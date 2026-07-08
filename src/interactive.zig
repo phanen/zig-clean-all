@@ -43,16 +43,7 @@ pub fn run(
     // summary line, then save the cursor (DECSC) at the top of the frame
     // so renderFrame can restore it via DECRC and never touch any output
     // above.
-    {
-        const w = tty.writer();
-        var i: u16 = 0;
-        while (i < frame_height) : (i += 1) {
-            w.writeAll("\r\n") catch {};
-        }
-        // Move cursor back to the top of the reserved block and save it.
-        w.print("\x1b[{d}A" ++ "\x1b7", .{frame_height}) catch {};
-        w.flush() catch {};
-    }
+    reserveFrame(tty.writer(), frame_height);
 
     var cursor: usize = 0;
     var outcome: Outcome = .cancel;
@@ -76,17 +67,7 @@ pub fn run(
     // cursor is left on the frame top row: emitting \r\n here would
     // leave a blank residue row and force the shell to redraw its
     // prompt further down than the caller expects.
-    {
-        const w = tty.writer();
-        w.writeAll("\x1b8") catch {}; // DECRC -> top of frame
-        w.writeAll("\x1b[?7l") catch {}; // disable wrap (fzf pattern)
-        w.writeAll(vaxis.ctlseqs.erase_below_cursor) catch {};
-        w.writeAll(vaxis.ctlseqs.show_cursor) catch {};
-        w.writeAll(vaxis.ctlseqs.sgr_reset) catch {};
-        w.writeAll(vaxis.ctlseqs.bp_reset) catch {};
-        w.writeAll("\x1b[?7h") catch {}; // re-enable wrap
-        w.flush() catch {};
-    }
+    eraseFrame(tty.writer());
 
     vx.screen.deinit(gpa);
     vx.screen_last.deinit(gpa);
@@ -105,6 +86,32 @@ pub fn run(
 
     tty.deinit();
     return outcome;
+}
+
+/// Reserve `frame_height` rows for the TUI block, then move the cursor back
+/// to the top of the block and save it (DECSC) so `renderFrame` can return
+/// there via DECRC.
+fn reserveFrame(w: *std.Io.Writer, frame_height: u16) void {
+    var i: u16 = 0;
+    while (i < frame_height) : (i += 1) {
+        w.writeAll("\r\n") catch {};
+    }
+    w.print("\x1b[{d}A" ++ "\x1b7", .{frame_height}) catch {};
+    w.flush() catch {};
+}
+
+/// Restore the frame-anchor cursor, erase the frame area below it, and
+/// reset every terminal mode we may have touched. Best-effort: a closed
+/// pipe or detached tty may have lost its write end.
+fn eraseFrame(w: *std.Io.Writer) void {
+    w.writeAll("\x1b8") catch {}; // DECRC -> top of frame
+    w.writeAll("\x1b[?7l") catch {}; // disable wrap (fzf pattern)
+    w.writeAll(vaxis.ctlseqs.erase_below_cursor) catch {};
+    w.writeAll(vaxis.ctlseqs.show_cursor) catch {};
+    w.writeAll(vaxis.ctlseqs.sgr_reset) catch {};
+    w.writeAll(vaxis.ctlseqs.bp_reset) catch {};
+    w.writeAll("\x1b[?7h") catch {}; // re-enable wrap
+    w.flush() catch {};
 }
 
 fn handleKey(
@@ -163,13 +170,13 @@ fn renderFrame(
     for (selections, 0..) |s, i| {
         const marker: []const u8 = if (s.selected) "[CLEAN]" else "[KEEP] ";
         var size_buf: [32]u8 = undefined;
-        const size_str = size_buf[0..format.formatBytes(&size_buf, s.analysis.total_size_bytes)];
+        const size_str = size_buf[0..format.formatBytes(&size_buf, s.item.analysis.total_size_bytes)];
         if (i == cursor) try w.writeAll(vaxis.ctlseqs.reverse_set);
-        try w.print(" {s} {s}  {s}\r\n", .{ marker, s.project.path, size_str });
+        try w.print(" {s} {s}  {s}\r\n", .{ marker, s.item.project.path, size_str });
         if (i == cursor) try w.writeAll(vaxis.ctlseqs.sgr_reset);
     }
 
-    try w.print(" [space] toggle  [a] all  [n] none  [\u{2191}\u{2193}] move  [enter] confirm  [q] cancel", .{});
+    try w.print(" [space] toggle  [a] all  [n] none  [up/down] move  [enter] confirm  [q] cancel", .{});
     try w.writeAll(vaxis.ctlseqs.show_cursor);
     try w.flush();
 }

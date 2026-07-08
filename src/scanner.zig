@@ -63,7 +63,7 @@ pub fn findProjects(
         if (entry.kind == .directory) {
             if (shouldSkipDescend(entry.basename)) continue;
             const abs = joinIntoArena(arena, root_base, entry.path) catch continue;
-            if (matchesAnySkipPath(abs, skip_paths)) continue;
+            if (pathIsUnderAny(abs, skip_paths)) continue;
             walker.enter(io, entry) catch continue;
             continue;
         }
@@ -73,7 +73,7 @@ pub fn findProjects(
 
         const dir_rel = path.dirname(entry.path) orelse "";
         const project_abs = joinIntoArena(arena, root_base, dir_rel) catch continue;
-        if (matchesAnySkipPath(project_abs, skip_paths)) continue;
+        if (pathIsUnderAny(project_abs, skip_paths)) continue;
         const owned = arena.dupe(u8, project_abs) catch continue;
         out.append(arena, .{ .path = owned }) catch continue;
     }
@@ -88,7 +88,6 @@ fn joinIntoArena(arena: Allocator, base: []const u8, rel: []const u8) ![]const u
 /// string-based path comparison inside `findProjects` is correct. Absolute
 /// paths are kept verbatim; relative paths are joined with the cwd.
 pub fn resolveSkipPaths(
-    io: Io,
     cwd_path: []const u8,
     skip_paths: []const []const u8,
     arena: Allocator,
@@ -103,7 +102,6 @@ pub fn resolveSkipPaths(
             resolved;
         try list.append(arena, trimmed);
     }
-    _ = io;
     return try list.toOwnedSlice(arena);
 }
 
@@ -115,30 +113,26 @@ fn shouldSkipDescend(basename: []const u8) bool {
     return false;
 }
 
-/// Returns true when `entry_path` equals or is nested inside one of the
-/// user-supplied skip roots. Compared as path strings; the caller is
-/// expected to have resolved and normalised each skip path.
-fn matchesAnySkipPath(
-    entry_path: []const u8,
-    skip_paths: []const []const u8,
-) bool {
-    for (skip_paths) |skip| {
-        if (std.mem.eql(u8, entry_path, skip)) return true;
-        if (entry_path.len > skip.len and
-            std.mem.eql(u8, entry_path[0..skip.len], skip) and
-            entry_path[skip.len] == path.sep)
-            return true;
+/// Returns true when `path` equals or is nested inside one of the supplied
+/// roots. Compared as path strings; the caller is expected to have resolved
+/// and normalised each root.
+pub fn pathIsUnderAny(p: []const u8, roots: []const []const u8) bool {
+    for (roots) |root| {
+        if (std.mem.eql(u8, p, root)) return true;
+        if (p.len > root.len and
+            std.mem.eql(u8, p[0..root.len], root) and
+            p[root.len] == path.sep) return true;
     }
     return false;
 }
 
-test "matchesAnySkipPath excludes nested dirs" {
+test "pathIsUnderAny excludes nested dirs" {
     const skips = [_][]const u8{"/data/skip"};
-    try std.testing.expect(matchesAnySkipPath("/data/skip", &skips));
-    try std.testing.expect(matchesAnySkipPath("/data/skip/sub", &skips));
-    try std.testing.expect(matchesAnySkipPath("/data/skip/sub/inner", &skips));
-    try std.testing.expect(!matchesAnySkipPath("/data/keep", &skips));
-    try std.testing.expect(!matchesAnySkipPath("/data/skippy", &skips));
+    try std.testing.expect(pathIsUnderAny("/data/skip", &skips));
+    try std.testing.expect(pathIsUnderAny("/data/skip/sub", &skips));
+    try std.testing.expect(pathIsUnderAny("/data/skip/sub/inner", &skips));
+    try std.testing.expect(!pathIsUnderAny("/data/keep", &skips));
+    try std.testing.expect(!pathIsUnderAny("/data/skippy", &skips));
 }
 
 test "shouldSkipDescend matches known artifact dirs" {

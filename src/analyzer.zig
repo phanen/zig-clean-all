@@ -27,7 +27,7 @@ pub const Analysis = struct {
     last_modified_ns: i128,
 };
 
-/// Open `project_path` and measure its build artifacts. The caller is
+/// Open `project_dir` and measure its build artifacts. The caller is
 /// responsible for the project directory handle.
 pub fn analyze(
     io: Io,
@@ -39,26 +39,9 @@ pub fn analyze(
     var total_size: u64 = 0;
     var latest_ns: i128 = 0;
 
-    var idx: usize = 0;
-    while (idx < ARTIFACT_NAMES.len) : (idx += 1) {
-        const name = ARTIFACT_NAMES[idx];
-        // `openDir` swallows most errors via the vtable; missing dirs surface
-        // as `FileNotFound` which we treat as "no artifact here".
-        const sub = project_dir.openDir(io, name, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        var closed = false;
-        defer if (!closed) sub.close(io);
-
-        const abs = try path.join(arena, &.{ project_path, name });
-        try found.append(arena, abs);
-
-        var measure: Measure = .{ .total_size = 0, .latest_ns = 0 };
-        try measureDir(io, sub, arena, &measure);
-        sub.close(io);
-        closed = true;
-
+    for (ARTIFACT_NAMES) |name| {
+        var measure: Measure = .zero;
+        try measureArtifact(io, project_dir, project_path, name, arena, &found, &measure);
         total_size += measure.total_size;
         if (measure.latest_ns > latest_ns) latest_ns = measure.latest_ns;
     }
@@ -70,9 +53,34 @@ pub fn analyze(
     };
 }
 
+/// Open one artifact sub-directory, record its absolute path, and walk it to
+/// tally size and mtime. Returns silently with `out` left at zero when the
+/// artifact does not exist.
+fn measureArtifact(
+    io: Io,
+    project_dir: Dir,
+    project_path: []const u8,
+    name: []const u8,
+    arena: Allocator,
+    found: *std.ArrayList([]const u8),
+    out: *Measure,
+) anyerror!void {
+    const sub = project_dir.openDir(io, name, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer sub.close(io);
+
+    const abs = try path.join(arena, &.{ project_path, name });
+    try found.append(arena, abs);
+    try measureDir(io, sub, arena, out);
+}
+
 const Measure = struct {
     total_size: u64,
     latest_ns: i128,
+
+    const zero: Measure = .{ .total_size = 0, .latest_ns = 0 };
 };
 
 /// Recursive visitor that counts bytes and tracks the maximum mtime. The
@@ -94,10 +102,9 @@ fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
         if (unwrapped.kind == .sym_link) continue;
         switch (unwrapped.kind) {
             .file => {
-                // Use `unwrapped.dir`, not the outer `dir`: the walker returns
-                // the containing directory of each entry, not the original
-                // root. Without this we'd always stat against the root and
-                // miss every nested file.
+                // `unwrapped.dir` is the containing directory of each entry,
+                // not the original root. Statting against the outer `dir`
+                // would miss every nested file.
                 const stat = unwrapped.dir.statFile(io, unwrapped.basename, .{}) catch continue;
                 out.total_size += stat.size;
                 const ns: i128 = stat.mtime.nanoseconds;

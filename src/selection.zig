@@ -4,17 +4,23 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const path = std.fs.path;
 
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
 const analyzer = @import("analyzer.zig");
 
-pub const Selection = struct {
+const NS_PER_S: i128 = 1_000_000_000;
+const SECS_PER_DAY: i128 = 86_400;
+
+pub const Item = struct {
     project: scanner.Project,
     analysis: analyzer.Analysis,
+};
+
+pub const Selection = struct {
+    item: Item,
     /// Set by `selectAll` based on the keep filters and the user's
-    /// --ignore paths. `true` means the entry should be skipped.
+    /// `--ignore` paths. `true` means the entry should be skipped.
     keep: bool,
     /// Set by the user (interactive mode) or defaults to `!keep`. After
     /// `selectAll` the field reflects the default-derived intent; an
@@ -22,63 +28,53 @@ pub const Selection = struct {
     selected: bool,
 };
 
-/// Pair every project with its analysis and decide whether the keep
-/// filters apply. Sort the result by ascending total_size so the largest
-/// cleanups land at the bottom of the print-out.
+/// Pair every project with its analysis and decide whether the keep filters
+/// apply. Sort the result by ascending total_size so the largest cleanups
+/// land at the bottom of the print-out.
 pub fn selectAll(
     io: Io,
     arena: Allocator,
-    c: cli.Cli,
-    projects: []scanner.Project,
-    analyses: []analyzer.Analysis,
+    opts: cli.Cli,
+    items: []const Item,
 ) ![]Selection {
     const now_ns: i128 = Io.Timestamp.now(io, .real).nanoseconds;
-    const keep_threshold_ns: i128 = @as(i128, c.keep_days) * 24 * 60 * 60 * 1_000_000_000;
+    const keep_threshold_ns: i128 = @as(i128, opts.keep_days) * SECS_PER_DAY * NS_PER_S;
 
     var out: std.ArrayList(Selection) = .empty;
-    for (projects, analyses) |proj, anal| {
-        const ignored = pathIsUnderAny(proj.path, c.ignore_paths);
-        const over_size = anal.total_size_bytes > c.keep_size_bytes;
+    for (items) |item| {
+        const ignored = scanner.pathIsUnderAny(item.project.path, opts.ignore_paths);
+        const over_size = item.analysis.total_size_bytes > opts.keep_size_bytes;
         const over_age = if (keep_threshold_ns == 0)
             true
         else
-            now_ns - anal.last_modified_ns >= keep_threshold_ns;
-        const has_artifacts = anal.artifact_paths.len > 0;
-        // Keep the project if any keep criterion trips: ignored, no artifacts,
-        // too small, or recently compiled. Matches cargo-clean-all's wiring.
+            now_ns - item.analysis.last_modified_ns >= keep_threshold_ns;
+        const has_artifacts = item.analysis.artifact_paths.len > 0;
+
+        // A project is kept if any keep criterion trips: ignored, no
+        // artifacts, too small, or recently compiled. Matches the
+        // cargo-clean-all wiring.
         const keep = ignored or !has_artifacts or !over_size or !over_age;
         try out.append(arena, .{
-            .project = proj,
-            .analysis = anal,
+            .item = item,
             .keep = keep,
             .selected = !keep,
         });
     }
-    const items = try out.toOwnedSlice(arena);
-    std.mem.sort(Selection, items, {}, lessThanSize);
-    return items;
+    const sorted = try out.toOwnedSlice(arena);
+    std.mem.sort(Selection, sorted, {}, lessThanSize);
+    return sorted;
 }
 
 fn lessThanSize(_: void, a: Selection, b: Selection) bool {
-    return a.analysis.total_size_bytes < b.analysis.total_size_bytes;
-}
-
-fn pathIsUnderAny(p: []const u8, roots: []const []const u8) bool {
-    for (roots) |root| {
-        if (std.mem.eql(u8, p, root)) return true;
-        if (p.len > root.len and
-            std.mem.eql(u8, p[0..root.len], root) and
-            p[root.len] == path.sep) return true;
-    }
-    return false;
+    return a.item.analysis.total_size_bytes < b.item.analysis.total_size_bytes;
 }
 
 test "pathIsUnderAny detects nested and exact matches" {
-    try std.testing.expect(pathIsUnderAny("/data/root", &.{"/data/root"}));
-    try std.testing.expect(pathIsUnderAny("/data/root/sub", &.{"/data/root"}));
-    try std.testing.expect(pathIsUnderAny("/data/root/sub/inner", &.{"/data/root"}));
-    try std.testing.expect(!pathIsUnderAny("/data/other", &.{"/data/root"}));
-    try std.testing.expect(!pathIsUnderAny("/data/rootx", &.{"/data/root"}));
+    try std.testing.expect(scanner.pathIsUnderAny("/data/root", &.{"/data/root"}));
+    try std.testing.expect(scanner.pathIsUnderAny("/data/root/sub", &.{"/data/root"}));
+    try std.testing.expect(scanner.pathIsUnderAny("/data/root/sub/inner", &.{"/data/root"}));
+    try std.testing.expect(!scanner.pathIsUnderAny("/data/other", &.{"/data/root"}));
+    try std.testing.expect(!scanner.pathIsUnderAny("/data/rootx", &.{"/data/root"}));
 }
 
 test "selectAll defaults selected when no filters active" {
@@ -102,16 +98,20 @@ test "selectAll defaults selected when no filters active" {
             .last_modified_ns = 0,
         },
     };
+    const items = [_]Item{
+        .{ .project = projects[0], .analysis = analyses[0] },
+        .{ .project = projects[1], .analysis = analyses[1] },
+    };
 
     var env: std.Io.Threaded = .init;
     defer env.deinit();
     const io = env.ioBasic();
 
-    const c: cli.Cli = .{};
-    const out = try selectAll(io, arena, c, &projects, &analyses);
+    const opts: cli.Cli = .{};
+    const out = try selectAll(io, arena, opts, &items);
     try std.testing.expectEqual(@as(usize, 2), out.len);
-    try std.testing.expect(!out[0].keep); // a has artifacts, selected by default
-    try std.testing.expect(out[1].keep); // b has no artifacts, kept
+    try std.testing.expect(!out[0].keep);
+    try std.testing.expect(out[1].keep);
 }
 
 test "selectAll respects keep_size" {
@@ -127,14 +127,17 @@ test "selectAll respects keep_size" {
             .last_modified_ns = 1,
         },
     };
+    const items = [_]Item{
+        .{ .project = projects[0], .analysis = analyses[0] },
+    };
 
     var env: std.Io.Threaded = .init;
     defer env.deinit();
     const io = env.ioBasic();
 
-    const c: cli.Cli = .{ .keep_size_bytes = 100 };
-    const out = try selectAll(io, arena, c, &projects, &analyses);
-    try std.testing.expect(out[0].keep); // smaller than threshold, kept
+    const opts: cli.Cli = .{ .keep_size_bytes = 100 };
+    const out = try selectAll(io, arena, opts, &items);
+    try std.testing.expect(out[0].keep);
     try std.testing.expect(!out[0].selected);
 }
 
@@ -151,13 +154,16 @@ test "selectAll respects ignore paths" {
             .last_modified_ns = 1,
         },
     };
+    const items = [_]Item{
+        .{ .project = projects[0], .analysis = analyses[0] },
+    };
 
     var env: std.Io.Threaded = .init;
     defer env.deinit();
     const io = env.ioBasic();
 
-    const c: cli.Cli = .{ .ignore_paths = &.{"/p/special"} };
-    const out = try selectAll(io, arena, c, &projects, &analyses);
+    const opts: cli.Cli = .{ .ignore_paths = &.{"/p/special"} };
+    const out = try selectAll(io, arena, opts, &items);
     try std.testing.expect(out[0].keep);
     try std.testing.expect(!out[0].selected);
 }
@@ -177,14 +183,19 @@ test "selectAll sorts results by ascending size" {
         .{ .artifact_paths = &.{"/p/small"}, .total_size_bytes = 100, .last_modified_ns = 1 },
         .{ .artifact_paths = &.{"/p/mid"}, .total_size_bytes = 3000, .last_modified_ns = 1 },
     };
+    const items = [_]Item{
+        .{ .project = projects[0], .analysis = analyses[0] },
+        .{ .project = projects[1], .analysis = analyses[1] },
+        .{ .project = projects[2], .analysis = analyses[2] },
+    };
 
     var env: std.Io.Threaded = .init;
     defer env.deinit();
     const io = env.ioBasic();
 
-    const c: cli.Cli = .{};
-    const out = try selectAll(io, arena, c, &projects, &analyses);
-    try std.testing.expectEqualStrings("/p/small", out[0].project.path);
-    try std.testing.expectEqualStrings("/p/mid", out[1].project.path);
-    try std.testing.expectEqualStrings("/p/big", out[2].project.path);
+    const opts: cli.Cli = .{};
+    const out = try selectAll(io, arena, opts, &items);
+    try std.testing.expectEqualStrings("/p/small", out[0].item.project.path);
+    try std.testing.expectEqualStrings("/p/mid", out[1].item.project.path);
+    try std.testing.expectEqualStrings("/p/big", out[2].item.project.path);
 }
