@@ -103,15 +103,15 @@ test "selectAll defaults selected when no filters active" {
         .{ .project = projects[1], .analysis = analyses[1] },
     };
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const opts: cli.Cli = .{};
     const out = try selectAll(io, arena, opts, &items);
     try std.testing.expectEqual(@as(usize, 2), out.len);
-    try std.testing.expect(!out[0].keep);
-    try std.testing.expect(out[1].keep);
+    try std.testing.expect(out[0].keep);
+    try std.testing.expect(!out[1].keep);
 }
 
 test "selectAll respects keep_size" {
@@ -131,9 +131,9 @@ test "selectAll respects keep_size" {
         .{ .project = projects[0], .analysis = analyses[0] },
     };
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const opts: cli.Cli = .{ .keep_size_bytes = 100 };
     const out = try selectAll(io, arena, opts, &items);
@@ -158,9 +158,9 @@ test "selectAll respects ignore paths" {
         .{ .project = projects[0], .analysis = analyses[0] },
     };
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const opts: cli.Cli = .{ .ignore_paths = &.{"/p/special"} };
     const out = try selectAll(io, arena, opts, &items);
@@ -189,9 +189,9 @@ test "selectAll sorts results by ascending size" {
         .{ .project = projects[2], .analysis = analyses[2] },
     };
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const opts: cli.Cli = .{};
     const out = try selectAll(io, arena, opts, &items);

@@ -31,16 +31,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zig-clean-all");
     run_step.dependOn(&run_cmd.step);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
+    const test_sources = [_][]const u8{
+        "src/analyzer.zig",
+        "src/cli.zig",
+        "src/cleaner.zig",
+        "src/format.zig",
+        "src/interactive.zig",
+        "src/scanner.zig",
+        "src/selection.zig",
+    };
+
+    const test_step = b.step("test", "Run unit tests");
+    for (test_sources) |src| {
+        const test_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path(src),
             .imports = &.{
                 .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             },
-        }),
-    });
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+        });
+        const tests = b.addTest(.{ .root_module = test_module });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 }

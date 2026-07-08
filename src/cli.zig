@@ -162,6 +162,7 @@ pub fn parseBytes(text: []const u8) ParseError!u64 {
         for (SIZE_SUFFIXES) |s| {
             if (mem.eql(u8, suffix_text, s.text)) break :blk s.multiplier;
         }
+        if (suffix_text.len == 0) break :blk 1;
         return ParseError.InvalidArgument;
     };
 
@@ -208,7 +209,9 @@ pub const usage =
 ;
 
 test "parse defaults" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const out = try parse(arena, &.{});
     try std.testing.expectEqualStrings(".", out[0].root_dir);
     try std.testing.expect(!out[0].yes);
@@ -221,7 +224,9 @@ test "parse defaults" {
 }
 
 test "interactive flag activates" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const long_argv = [_][]const u8{"--interactive"};
     const out_long = try parse(arena, &long_argv);
     try std.testing.expect(out_long[0].interactive);
@@ -232,7 +237,9 @@ test "interactive flag activates" {
 }
 
 test "parse directory and flags" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--yes", "--keep-days", "7", "-s", "10MB", "/tmp" };
     const out = try parse(arena, &argv);
     try std.testing.expectEqualStrings("/tmp", out[0].root_dir);
@@ -256,19 +263,25 @@ test "parse rejects garbage" {
 }
 
 test "unknown flag is rejected" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{"--no-such-flag"};
     try std.testing.expectError(ParseError.UnknownFlag, parse(arena, &argv));
 }
 
 test "missing value is rejected" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{"--keep-size"};
     try std.testing.expectError(ParseError.MissingValue, parse(arena, &argv));
 }
 
 test "ignore and skip accumulate" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{
         "--ignore", "a",
         "--ignore", "b",
@@ -283,21 +296,27 @@ test "ignore and skip accumulate" {
 }
 
 test "--help is detected" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{"--help"};
     const out = try parse(arena, &argv);
     try std.testing.expectEqual(@as(HelpOrVersion, .help), out[1]);
 }
 
 test "--version is detected" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{"--version"};
     const out = try parse(arena, &argv);
     try std.testing.expectEqual(@as(HelpOrVersion, .version), out[1]);
 }
 
 test "double dash stops flag parsing" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--yes", "--", "--not-a-flag" };
     const out = try parse(arena, &argv);
     try std.testing.expect(out[0].yes);
@@ -305,7 +324,9 @@ test "double dash stops flag parsing" {
 }
 
 test "keep-size and keep-days inline form" {
-    const arena = std.testing.allocator;
+    var arena_buf: [4096]u8 = undefined;
+    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--keep-size=2MiB", "--keep-days=3", "." };
     const out = try parse(arena, &argv);
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), out[0].keep_size_bytes);

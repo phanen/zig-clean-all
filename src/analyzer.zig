@@ -7,6 +7,7 @@
 //! followed - they would invite both cycles and double-counting.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs = std.fs;
 const path = fs.path;
 const Allocator = std.mem.Allocator;
@@ -71,7 +72,7 @@ fn measureArtifact(
     };
     defer sub.close(io);
 
-    const abs = try path.join(arena, &.{ project_path, name });
+    const abs = try std.fs.path.join(arena, &.{ project_path, name });
     try found.append(arena, abs);
     try measureDir(io, sub, arena, out);
 }
@@ -82,6 +83,15 @@ const Measure = struct {
 
     const zero: Measure = .{ .total_size = 0, .latest_ns = 0 };
 };
+
+/// Best-effort chmod used by fixture setup. `std.os.linux.chmod` returns a
+/// raw syscall result, so wrap it and swallow any error so the test
+/// continues even when the kernel refuses (for example in a sandbox).
+fn chmodOrSkip(raw_path: []const u8, mode: u32) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z_path = std.fmt.bufPrintZ(&buf, "{s}", .{raw_path}) catch return;
+    _ = std.os.linux.chmod(z_path, mode);
+}
 
 /// Recursive visitor that counts bytes and tracks the maximum mtime. The
 /// walker deliberately stops at symlinks to avoid loops and double counting.
@@ -97,20 +107,20 @@ fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
     defer walker.deinit();
 
     while (true) {
-        const entry = walker.next(io) catch return;
-        const unwrapped = entry orelse break;
-        if (unwrapped.kind == .sym_link) continue;
-        switch (unwrapped.kind) {
+        const next_result = walker.next(io) catch break;
+        const entry = next_result orelse break;
+        if (entry.kind == .sym_link) continue;
+        switch (entry.kind) {
             .file => {
-                // `unwrapped.dir` is the containing directory of each entry,
+                // `entry.dir` is the containing directory of each entry,
                 // not the original root. Statting against the outer `dir`
                 // would miss every nested file.
-                const stat = unwrapped.dir.statFile(io, unwrapped.basename, .{}) catch continue;
+                const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
                 out.total_size += stat.size;
                 const ns: i128 = stat.mtime.nanoseconds;
                 if (ns > out.latest_ns) out.latest_ns = ns;
             },
-            .directory => walker.enter(io, unwrapped) catch continue,
+            .directory => walker.enter(io, entry) catch continue,
             else => continue,
         }
     }
@@ -118,32 +128,35 @@ fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
 
 test "analyze swallows unreadable sub-trees instead of aborting" {
     // Skip when running as root, because root bypasses mode bits.
-    if (std.posix.geteuid() == 0) return;
+    if (builtin.os.tag != .linux) return;
+    if (std.os.linux.geteuid() == 0) return;
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const fixture_root = "/tmp/zca-analyzer-unreadable";
     const cwd = Dir.cwd();
     cwd.deleteTree(io, fixture_root) catch {};
 
-    try cwd.makeDir(io, fixture_root);
-    try cwd.makePath(io, fixture_root ++ "/.zig-cache/locked");
-    try cwd.makePath(io, fixture_root ++ "/.zig-cache/open");
+    try cwd.createDir(io, fixture_root, .default_dir);
+    try cwd.createDirPath(io, fixture_root ++ "/.zig-cache/locked");
+    try cwd.createDirPath(io, fixture_root ++ "/.zig-cache/open");
     {
         const dir = try cwd.openDir(io, fixture_root ++ "/.zig-cache/open", .{});
         defer dir.close(io);
-        var file = try dir.openFile(io, "ok.txt", .{ .mode = .read_write });
+        var file = try dir.createFile(io, "ok.txt", .{});
         defer file.close(io);
         try file.writeStreamingAll(io, "fine");
     }
-    try std.posix.chmod(fixture_root ++ "/.zig-cache/locked", 0o000);
+    chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o000);
 
-    defer std.posix.chmod(fixture_root ++ "/.zig-cache/locked", 0o755) catch {};
+    // Defers run in reverse: restore permissions first so the recursive
+    // deleteTree below can actually traverse the locked sub-tree.
     defer cwd.deleteTree(io, fixture_root) catch {};
+    defer chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o755);
 
-    var arena_buf: [4096]u8 = undefined;
+    var arena_buf: [65536]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
     const arena = arena_alloc.allocator();
 

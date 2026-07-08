@@ -169,14 +169,14 @@ fn emptyDir(io: Io, parent: Dir, name: []const u8) anyerror!void {
 }
 
 test "cleanAll no-op on missing artifact directories" {
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const fake_root = "/tmp/zca-cleaner-missing";
     std.Io.Dir.cwd().deleteTree(io, fake_root) catch {};
-    try std.Io.Dir.cwd().makeDir(io, fake_root);
-    try std.Io.Dir.cwd().makePath(io, fake_root ++ "/build.zig.touch");
+    try std.Io.Dir.cwd().createDir(io, fake_root, .default_dir);
+    try std.Io.Dir.cwd().createDirPath(io, fake_root ++ "/build.zig.touch");
 
     var arena_buf: [4096]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
@@ -191,9 +191,9 @@ test "cleanAll no-op on missing artifact directories" {
 }
 
 test "emptyDir removes file contents" {
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     // Build a tiny fixture: /tmp/zca-empty-test/{.zig-cache/file.txt}
     const fixture_root = "/tmp/zca-empty-test";
@@ -202,12 +202,12 @@ test "emptyDir removes file contents" {
     const cwd = Dir.cwd();
     cwd.deleteTree(io, fixture_root) catch {};
 
-    try cwd.makeDir(io, fixture_root);
-    try cwd.makePath(io, fixture_root ++ "/" ++ artifact_rel);
+    try cwd.createDir(io, fixture_root, .default_dir);
+    try cwd.createDirPath(io, fixture_root ++ "/" ++ artifact_rel);
     {
         const dir = try cwd.openDir(io, fixture_root, .{});
         defer dir.close(io);
-        var file = try dir.openFile(io, file_rel, .{ .mode = .read_write });
+        var file = try dir.createFile(io, file_rel, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, "hello");
     }

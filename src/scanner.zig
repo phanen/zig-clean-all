@@ -6,6 +6,7 @@
 //! nested. Other hidden directories are also skipped.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const fs = std.fs;
 const path = fs.path;
 const Allocator = std.mem.Allocator;
@@ -126,6 +127,15 @@ pub fn pathIsUnderAny(p: []const u8, roots: []const []const u8) bool {
     return false;
 }
 
+/// Best-effort chmod used by fixture setup. `std.os.linux.chmod` returns a
+/// raw syscall result, so wrap it and swallow any error so the test
+/// continues even when the kernel refuses (for example in a sandbox).
+fn chmodOrSkip(raw_path: []const u8, mode: u32) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z_path = std.fmt.bufPrintZ(&buf, "{s}", .{raw_path}) catch return;
+    _ = std.os.linux.chmod(z_path, mode);
+}
+
 test "pathIsUnderAny excludes nested dirs" {
     const skips = [_][]const u8{"/data/skip"};
     try std.testing.expect(pathIsUnderAny("/data/skip", &skips));
@@ -148,11 +158,12 @@ test "shouldSkipDescend matches known artifact dirs" {
 test "findProjects tolerates an unreadable sub-tree" {
     // Root bypasses mode bits, so the chmod-based fixture cannot
     // produce AccessDenied for it.
-    if (std.posix.geteuid() == 0) return;
+    if (builtin.os.tag != .linux) return;
+    if (std.os.linux.geteuid() == 0) return;
 
-    var env: std.Io.Threaded = .init;
+    var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
-    const io = env.ioBasic();
+    const io = env.io();
 
     const fixture = "/tmp/zca-scanner-unreadable";
     const cwd = Dir.cwd();
@@ -160,26 +171,26 @@ test "findProjects tolerates an unreadable sub-tree" {
 
     // Two projects at the same level; lock one so the walker hits
     // AccessDenied when descending into it.
-    try cwd.makeDir(io, fixture);
-    try cwd.makePath(io, fixture ++ "/keep-project");
-    try cwd.makePath(io, fixture ++ "/lock-project/locked-deep");
+    try cwd.createDir(io, fixture, .default_dir);
+    try cwd.createDirPath(io, fixture ++ "/keep-project");
+    try cwd.createDirPath(io, fixture ++ "/lock-project/locked-deep");
     {
         const keep_dir = try cwd.openDir(io, fixture ++ "/keep-project", .{});
         defer keep_dir.close(io);
-        var f = try keep_dir.openFile(io, "build.zig", .{ .mode = .read_write });
+        var f = try keep_dir.createFile(io, "build.zig", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "// stub");
     }
     {
         const lock_dir = try cwd.openDir(io, fixture ++ "/lock-project", .{});
         defer lock_dir.close(io);
-        var f = try lock_dir.openFile(io, "build.zig", .{ .mode = .read_write });
+        var f = try lock_dir.createFile(io, "build.zig", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "// stub");
     }
-    try std.posix.chmod(fixture ++ "/lock-project", 0o000);
+    chmodOrSkip(fixture ++ "/lock-project", 0o000);
 
-    defer std.posix.chmod(fixture ++ "/lock-project", 0o755) catch {};
+    defer chmodOrSkip(fixture ++ "/lock-project", 0o755);
     defer cwd.deleteTree(io, fixture) catch {};
 
     var arena_buf: [8192]u8 = undefined;

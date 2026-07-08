@@ -43,7 +43,10 @@ pub fn formatTimestamp(buf: []u8, nanoseconds: i128) usize {
     // Howard Hinnant's days_from_civil; inverse of days_from_civil via a
     // direct conversion. We only need the date portion, not time-of-day
     // precision beyond minutes.
-    const z: i128 = secs / SECS_PER_DAY;
+    // Offset from civil-from-days epoch (0000-03-01) to Unix epoch. The Hinnant
+    // algorithms assume the input is in civil days, not Unix days.
+    const CIVIL_EPOCH_OFFSET: i128 = 719_468;
+    const z: i128 = @divTrunc(secs, SECS_PER_DAY) + CIVIL_EPOCH_OFFSET;
     const secs_of_day: i128 = @mod(secs, SECS_PER_DAY);
     const era: i128 = if (z >= 0) @divFloor(z, DAYS_PER_ERA) else @divFloor(z - DAYS_PER_400Y, DAYS_PER_ERA);
     const doe: i128 = z - era * DAYS_PER_ERA;
@@ -60,7 +63,13 @@ pub fn formatTimestamp(buf: []u8, nanoseconds: i128) usize {
     return (std.fmt.bufPrint(
         buf,
         "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}",
-        .{ year, m, d, hour, min },
+        .{
+            @as(u64, @intCast(year)),
+            @as(u64, @intCast(m)),
+            @as(u64, @intCast(d)),
+            @as(u64, @intCast(hour)),
+            @as(u64, @intCast(min)),
+        },
     ) catch return 0).len;
 }
 

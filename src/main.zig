@@ -9,6 +9,9 @@ const interactive_mod = @import("interactive.zig");
 
 const version = "0.1.0";
 
+const ANSI_GREEN: []const u8 = "\x1b[32m";
+const ANSI_RESET: []const u8 = "\x1b[0m";
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -71,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
         var kept_buf: [128]u8 = undefined;
         try printOut(
             io,
-            "selected {d}/{d} projects; would free {s}; keeping {s}\n",
+            "Selected {d}/{d} projects, cleaning will free: {s}. Keeping: {s}.\n",
             .{
                 count_selected,
                 selections.len,
@@ -79,6 +82,16 @@ pub fn main(init: std.process.Init) !void {
                 kept_buf[0..format.formatBytes(&kept_buf, bytes_kept)],
             },
         );
+    }
+
+    // In non-interactive mode the user only sees the summary line, which
+    // doesn't tell them which projects are about to be removed. Dump the
+    // selected entries so they can sanity-check before answering y/N. The
+    // interactive TUI shows the same list inline, so skip it there.
+    if (count_selected > 0) {
+        if (!opts.interactive) {
+            try printSelectionList(io, selections);
+        }
     }
 
     if (opts.dry_run) {
@@ -145,7 +158,7 @@ fn decideProceed(
 /// Read a single line from stdin and return true if it starts with 'y' or
 /// 'Y'. Anything else (including EOF) returns false.
 fn confirmPrompt(io: std.Io) !bool {
-    try printOut(io, "Proceed with cleanup? [y/N] ", .{});
+    try printOut(io, "Clean the project directories shown above? [y/n] ", .{});
     var buf: [16]u8 = undefined;
     var stdin = std.Io.File.stdin();
     var reader = stdin.reader(io, &buf);
@@ -178,6 +191,38 @@ fn totalKeptBytes(s: []const selection.Selection) u64 {
     return total;
 }
 
+/// Write the list of projects that will be cleaned, one per line, under a
+/// "Selected the following project directories for cleaning:" heading.
+/// Each entry's basename is wrapped in ANSI green so the project name
+/// stands out from its full path and size. Buffered through a single
+/// writer so a long list doesn't trigger a flush per entry. A trailing
+/// blank line separates the listing from whatever follows.
+fn printSelectionList(
+    io: std.Io,
+    selections: []const selection.Selection,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll("Selected the following project directories for cleaning:\n");
+    for (selections) |s| {
+        if (!s.selected) continue;
+        var size_buf: [32]u8 = undefined;
+        var date_buf: [32]u8 = undefined;
+        const size_str = size_buf[0..format.formatBytes(&size_buf, s.item.analysis.total_size_bytes)];
+        const date_str = date_buf[0..format.formatTimestamp(&date_buf, s.item.analysis.last_modified_ns)];
+        const basename = std.fs.path.basename(s.item.project.path);
+        const display_name = if (basename.len == 0) s.item.project.path else basename;
+        try w.interface.print(ANSI_GREEN ++ "{s}" ++ ANSI_RESET ++ ": {s} ({s}), {s}\n", .{
+            display_name,
+            size_str,
+            date_str,
+            s.item.project.path,
+        });
+    }
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+}
+
 const Stream = enum { stdout, stderr };
 
 fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
@@ -197,4 +242,8 @@ fn writeStream(io: std.Io, stream: Stream, comptime fmt: []const u8, args: anyty
     var w = file.writer(io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
+}
+
+test "main module smoke" {
+    try std.testing.expect(true);
 }

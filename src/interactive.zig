@@ -209,19 +209,23 @@ fn handleKey(
     return true;
 }
 
-/// Scroll one screen forward and advance the cursor by the same amount,
-/// clamping to the last entry. No-op when the view is already at the end.
+/// Scroll one screen forward and anchor the cursor at the top of the new
+/// view; on the final page jump it to the last entry. No-op when the view
+/// is already at the end.
 fn pageDown(view_top: *usize, cursor: *usize, visible_rows: usize, total: usize) void {
     const max_top = if (total > visible_rows) total - visible_rows else 0;
-    view_top.* = @min(view_top.* + visible_rows, max_top);
-    cursor.* = @min(cursor.* + visible_rows, total - 1);
+    const new_top = @min(view_top.* + visible_rows, max_top);
+    view_top.* = new_top;
+    cursor.* = if (new_top + visible_rows >= total) total - 1 else new_top;
 }
 
-/// Scroll one screen backward and rewind the cursor by the same amount,
-/// clamping to the first entry. No-op when the view is already at the top.
+/// Scroll one screen backward and anchor the cursor at the top of the new
+/// view; on the first page jump it to the first entry. No-op when the view
+/// is already at the top.
 fn pageUp(view_top: *usize, cursor: *usize, visible_rows: usize) void {
-    view_top.* = if (view_top.* >= visible_rows) view_top.* - visible_rows else 0;
-    cursor.* = if (cursor.* >= visible_rows) cursor.* - visible_rows else 0;
+    const new_top = if (view_top.* >= visible_rows) view_top.* - visible_rows else 0;
+    view_top.* = new_top;
+    cursor.* = if (new_top == 0) 0 else new_top;
 }
 
 /// Slide the view so the cursor stays inside `[view_top, view_top+visible)`.
@@ -342,15 +346,15 @@ test "pageUp retreats by one visible page" {
     var cursor: usize = 19;
     pageUp(&view_top, &cursor, 5);
     try std.testing.expectEqual(@as(usize, 10), view_top);
-    try std.testing.expectEqual(@as(usize, 14), cursor);
+    try std.testing.expectEqual(@as(usize, 10), cursor);
 
     pageUp(&view_top, &cursor, 5);
     try std.testing.expectEqual(@as(usize, 5), view_top);
-    try std.testing.expectEqual(@as(usize, 9), cursor);
+    try std.testing.expectEqual(@as(usize, 5), cursor);
 
     pageUp(&view_top, &cursor, 5);
     try std.testing.expectEqual(@as(usize, 0), view_top);
-    try std.testing.expectEqual(@as(usize, 4), cursor);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
 
     pageUp(&view_top, &cursor, 5);
     try std.testing.expectEqual(@as(usize, 0), view_top);
