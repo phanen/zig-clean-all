@@ -4,11 +4,20 @@
 //! repaint the frame from the top of our allocated block on every key press.
 //! On exit we move the cursor back to the top of the frame and erase, so
 //! the caller's earlier output above stays visible.
+//!
+//! Render height is bounded by the terminal's row count. When the project
+//! list is taller than one screen, the TUI pages: only `visible_rows`
+//! entries are drawn at a time, and `view_top` shifts to keep the cursor on
+//! screen. Page-up/page-down jump by one screen; home/end jump to the
+//! extremes.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const Selection = @import("selection.zig").Selection;
 const format = @import("format.zig");
+
+const HELP_LINES: u16 = 1;
+const DEFAULT_SCREEN_ROWS: u16 = 24;
 
 const AppEvent = union(enum) {
     winsize: vaxis.Winsize,
@@ -37,7 +46,16 @@ pub fn run(
     try loop.start();
     defer loop.stop();
 
-    const frame_height: u16 = @intCast(selections.len + 1);
+    var winsize: vaxis.Winsize = tty.getWinsize() catch .{
+        .rows = DEFAULT_SCREEN_ROWS,
+        .cols = 80,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    };
+
+    const total: usize = selections.len;
+    const visible_rows = computeVisibleRows(winsize.rows, total);
+    const frame_height: u16 = @intCast(visible_rows + HELP_LINES);
 
     // Reserve rows for the frame so it has its own block below the caller's
     // summary line, then save the cursor (DECSC) at the top of the frame
@@ -45,16 +63,26 @@ pub fn run(
     // above.
     reserveFrame(tty.writer(), frame_height);
 
+    var view_top: usize = 0;
     var cursor: usize = 0;
     var outcome: Outcome = .cancel;
     var running: bool = true;
 
     while (running) {
-        renderFrame(tty.writer(), selections, cursor) catch return .cancel;
+        renderFrame(tty.writer(), selections, view_top, visible_rows, cursor, total) catch return .cancel;
 
         const event = loop.nextEvent() catch break;
         switch (event) {
-            .key_press => |k| running = handleKey(k, selections, &cursor, &outcome),
+            .winsize => |ws| winsize = ws,
+            .key_press => |k| running = handleKey(
+                k,
+                selections,
+                total,
+                visible_rows,
+                &view_top,
+                &cursor,
+                &outcome,
+            ),
             else => {},
         }
     }
@@ -88,6 +116,16 @@ pub fn run(
     return outcome;
 }
 
+/// How many entry rows fit on screen given the current winsize. Always
+/// returns at least one row so the TUI never renders an empty window.
+fn computeVisibleRows(screen_rows: u16, total: usize) usize {
+    const max_visible = if (screen_rows > HELP_LINES)
+        @as(usize, screen_rows) - HELP_LINES
+    else
+        @as(usize, 1);
+    return if (total < max_visible) total else max_visible;
+}
+
 /// Reserve `frame_height` rows for the TUI block, then move the cursor back
 /// to the top of the block and save it (DECSC) so `renderFrame` can return
 /// there via DECRC.
@@ -117,6 +155,9 @@ fn eraseFrame(w: *std.Io.Writer) void {
 fn handleKey(
     k: vaxis.Key,
     selections: []Selection,
+    total: usize,
+    visible_rows: usize,
+    view_top: *usize,
     cursor: *usize,
     outcome: *Outcome,
 ) bool {
@@ -125,7 +166,16 @@ fn handleKey(
             if (cursor.* > 0) cursor.* -= 1;
         },
         vaxis.Key.down => {
-            if (cursor.* + 1 < selections.len) cursor.* += 1;
+            if (cursor.* + 1 < total) cursor.* += 1;
+        },
+        vaxis.Key.page_up => pageUp(view_top, cursor, visible_rows),
+        vaxis.Key.page_down => pageDown(view_top, cursor, visible_rows, total),
+        vaxis.Key.home => {
+            view_top.* = 0;
+            cursor.* = 0;
+        },
+        vaxis.Key.end => {
+            cursor.* = total - 1;
         },
         vaxis.Key.space => {
             const s: *Selection = &selections[cursor.*];
@@ -151,13 +201,44 @@ fn handleKey(
         },
         else => {},
     }
+    adjustView(view_top, cursor.*, visible_rows, total);
     return true;
+}
+
+/// Scroll one screen forward and advance the cursor by the same amount,
+/// clamping to the last entry. No-op when the view is already at the end.
+fn pageDown(view_top: *usize, cursor: *usize, visible_rows: usize, total: usize) void {
+    const max_top = if (total > visible_rows) total - visible_rows else 0;
+    view_top.* = @min(view_top.* + visible_rows, max_top);
+    cursor.* = @min(cursor.* + visible_rows, total - 1);
+}
+
+/// Scroll one screen backward and rewind the cursor by the same amount,
+/// clamping to the first entry. No-op when the view is already at the top.
+fn pageUp(view_top: *usize, cursor: *usize, visible_rows: usize) void {
+    view_top.* = if (view_top.* >= visible_rows) view_top.* - visible_rows else 0;
+    cursor.* = if (cursor.* >= visible_rows) cursor.* - visible_rows else 0;
+}
+
+/// Slide the view so the cursor stays inside `[view_top, view_top+visible)`.
+/// Call after every operation that moves the cursor.
+fn adjustView(view_top: *usize, cursor: usize, visible_rows: usize, total: usize) void {
+    const max_top = if (total > visible_rows) total - visible_rows else 0;
+    if (cursor < view_top.*) {
+        view_top.* = cursor;
+    } else if (cursor >= view_top.* + visible_rows) {
+        view_top.* = cursor + 1 - visible_rows;
+    }
+    if (view_top.* > max_top) view_top.* = max_top;
 }
 
 fn renderFrame(
     w: *std.Io.Writer,
     selections: []Selection,
+    view_top: usize,
+    visible_rows: usize,
     cursor: usize,
+    total: usize,
 ) !void {
     // DECRC restores the cursor to the position captured by DECSC in `run`,
     // which is the top of the frame. From there we erase everything below
@@ -167,16 +248,109 @@ fn renderFrame(
     try w.writeAll(vaxis.ctlseqs.erase_below_cursor);
     try w.writeAll(vaxis.ctlseqs.hide_cursor);
 
-    for (selections, 0..) |s, i| {
+    var i: usize = 0;
+    while (i < visible_rows and view_top + i < total) : (i += 1) {
+        const idx = view_top + i;
+        const s = selections[idx];
         const marker: []const u8 = if (s.selected) "[CLEAN]" else "[KEEP] ";
         var size_buf: [32]u8 = undefined;
         const size_str = size_buf[0..format.formatBytes(&size_buf, s.item.analysis.total_size_bytes)];
-        if (i == cursor) try w.writeAll(vaxis.ctlseqs.reverse_set);
+        if (idx == cursor) try w.writeAll(vaxis.ctlseqs.reverse_set);
         try w.print(" {s} {s}  {s}\r\n", .{ marker, s.item.project.path, size_str });
-        if (i == cursor) try w.writeAll(vaxis.ctlseqs.sgr_reset);
+        if (idx == cursor) try w.writeAll(vaxis.ctlseqs.sgr_reset);
     }
 
-    try w.print(" [space] toggle  [a] all  [n] none  [up/down] move  [enter] confirm  [q] cancel", .{});
+    if (total > visible_rows) {
+        try w.print(
+            " [space] toggle  [a] all  [n] none  [up/down] move  [pgup/pgdn] page  [enter] confirm  [q] cancel  ({d}/{d})",
+            .{ cursor + 1, total },
+        );
+    } else {
+        try w.print(
+            " [space] toggle  [a] all  [n] none  [up/down] move  [enter] confirm  [q] cancel",
+            .{},
+        );
+    }
     try w.writeAll(vaxis.ctlseqs.show_cursor);
     try w.flush();
+}
+
+test "computeVisibleRows caps at screen height" {
+    try std.testing.expectEqual(@as(usize, 5), computeVisibleRows(6, 100));
+    try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(2, 100));
+    try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(1, 100));
+    try std.testing.expectEqual(@as(usize, 3), computeVisibleRows(10, 3));
+    try std.testing.expectEqual(@as(usize, 9), computeVisibleRows(10, 9));
+}
+
+test "adjustView keeps cursor in the visible window" {
+    var view_top: usize = 0;
+    adjustView(&view_top, 0, 5, 20);
+    try std.testing.expectEqual(@as(usize, 0), view_top);
+
+    adjustView(&view_top, 10, 5, 20);
+    try std.testing.expectEqual(@as(usize, 6), view_top);
+
+    adjustView(&view_top, 6, 5, 20);
+    try std.testing.expectEqual(@as(usize, 6), view_top);
+
+    adjustView(&view_top, 2, 5, 20);
+    try std.testing.expectEqual(@as(usize, 2), view_top);
+
+    // Cursor at end: view should clamp so cursor is visible.
+    adjustView(&view_top, 19, 5, 20);
+    try std.testing.expectEqual(@as(usize, 15), view_top);
+}
+
+test "pageDown advances by one visible page" {
+    var view_top: usize = 0;
+    var cursor: usize = 0;
+    pageDown(&view_top, &cursor, 5, 20);
+    try std.testing.expectEqual(@as(usize, 5), view_top);
+    try std.testing.expectEqual(@as(usize, 5), cursor);
+
+    pageDown(&view_top, &cursor, 5, 20);
+    try std.testing.expectEqual(@as(usize, 10), view_top);
+    try std.testing.expectEqual(@as(usize, 10), cursor);
+
+    // Past the end clamps to the last entry / last page.
+    pageDown(&view_top, &cursor, 5, 20);
+    try std.testing.expectEqual(@as(usize, 15), view_top);
+    try std.testing.expectEqual(@as(usize, 19), cursor);
+
+    pageDown(&view_top, &cursor, 5, 20);
+    try std.testing.expectEqual(@as(usize, 15), view_top);
+    try std.testing.expectEqual(@as(usize, 19), cursor);
+}
+
+test "pageUp retreats by one visible page" {
+    var view_top: usize = 15;
+    var cursor: usize = 19;
+    pageUp(&view_top, &cursor, 5);
+    try std.testing.expectEqual(@as(usize, 10), view_top);
+    try std.testing.expectEqual(@as(usize, 14), cursor);
+
+    pageUp(&view_top, &cursor, 5);
+    try std.testing.expectEqual(@as(usize, 5), view_top);
+    try std.testing.expectEqual(@as(usize, 9), cursor);
+
+    pageUp(&view_top, &cursor, 5);
+    try std.testing.expectEqual(@as(usize, 0), view_top);
+    try std.testing.expectEqual(@as(usize, 4), cursor);
+
+    pageUp(&view_top, &cursor, 5);
+    try std.testing.expectEqual(@as(usize, 0), view_top);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
+}
+
+test "paging is a no-op when everything fits" {
+    var view_top: usize = 0;
+    var cursor: usize = 0;
+    pageDown(&view_top, &cursor, 5, 3);
+    try std.testing.expectEqual(@as(usize, 0), view_top);
+    try std.testing.expectEqual(@as(usize, 2), cursor);
+
+    pageUp(&view_top, &cursor, 5);
+    try std.testing.expectEqual(@as(usize, 0), view_top);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
 }
