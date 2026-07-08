@@ -68,20 +68,23 @@ pub fn run(
         }
     }
 
-    // Restore the frame area, lift the cursor back to the caller's row,
-    // and reset every terminal mode we may have touched. Without these the
-    // shell that takes over after we exit sees a hidden cursor and stale
-    // SGR attributes, so the user has to press Enter to refresh the prompt.
+    // Anchor the cursor at the top of the frame, erase the frame area,
+    // and reset every terminal mode we may have touched. Wrap mode is
+    // toggled off around the erase so a long line can't wrap to a row
+    // outside the frame; we re-enable it before returning so the shell
+    // that takes over after we exit sees a fully reset device. The
+    // cursor is left on the frame top row: emitting \r\n here would
+    // leave a blank residue row and force the shell to redraw its
+    // prompt further down than the caller expects.
     {
         const w = tty.writer();
         w.writeAll("\x1b8") catch {}; // DECRC -> top of frame
+        w.writeAll("\x1b[?7l") catch {}; // disable wrap (fzf pattern)
         w.writeAll(vaxis.ctlseqs.erase_below_cursor) catch {};
         w.writeAll(vaxis.ctlseqs.show_cursor) catch {};
         w.writeAll(vaxis.ctlseqs.sgr_reset) catch {};
         w.writeAll(vaxis.ctlseqs.bp_reset) catch {};
-        // Move cursor back to the row above the frame so the next line of
-        // output (cleanup summary, shell prompt, etc.) starts cleanly.
-        w.writeAll("\r\n") catch {};
+        w.writeAll("\x1b[?7h") catch {}; // re-enable wrap
         w.flush() catch {};
     }
 
@@ -91,6 +94,14 @@ pub fn run(
         gpa.free(vx.screen.cursor_secondary);
     if (vx.state.prev_cursor_secondary.len > 0)
         gpa.free(vx.state.prev_cursor_secondary);
+
+    // Stop the input thread BEFORE closing the tty. vaxis's Loop.stop
+    // writes a DSR query and awaits the thread; both need a live fd.
+    // Waiting until after tty.deinit (via defer) leaves the thread
+    // blocked in tty.read on a closed fd with no shutdown signal,
+    // which can stall long enough that the shell's prompt-redraw
+    // window closes and the user has to press Enter to refresh.
+    loop.stop();
 
     tty.deinit();
     return outcome;
