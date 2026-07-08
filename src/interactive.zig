@@ -116,14 +116,18 @@ pub fn run(
     return outcome;
 }
 
-/// How many entry rows fit on screen given the current winsize. Always
-/// returns at least one row so the TUI never renders an empty window.
+/// How many entry rows fit on screen. The frame (entries + help line) is
+/// capped at one third of the terminal height so the TUI never occupies
+/// more than that share of the user's scrollback. Floors at one row so a
+/// tiny terminal still shows something, and at two rows total (one entry
+/// plus the help line) so the TUI never renders an empty window.
 fn computeVisibleRows(screen_rows: u16, total: usize) usize {
-    const max_visible = if (screen_rows > HELP_LINES)
-        @as(usize, screen_rows) - HELP_LINES
+    const raw_cap: usize = if (screen_rows >= 3)
+        @as(usize, screen_rows) / 3
     else
-        @as(usize, 1);
-    return if (total < max_visible) total else max_visible;
+        @as(usize, 2);
+    const max_visible: usize = if (raw_cap > HELP_LINES) raw_cap - HELP_LINES else 1;
+    return @max(@as(usize, 1), @min(total, max_visible));
 }
 
 /// Reserve `frame_height` rows for the TUI block, then move the cursor back
@@ -275,12 +279,22 @@ fn renderFrame(
     try w.flush();
 }
 
-test "computeVisibleRows caps at screen height" {
-    try std.testing.expectEqual(@as(usize, 5), computeVisibleRows(6, 100));
+test "computeVisibleRows caps at one third of screen height" {
+    // 6 rows -> cap 2 -> max_visible 1
+    try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(6, 100));
+    // Tiny terminals fall back to the 2-row floor.
     try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(2, 100));
     try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(1, 100));
-    try std.testing.expectEqual(@as(usize, 3), computeVisibleRows(10, 3));
-    try std.testing.expectEqual(@as(usize, 9), computeVisibleRows(10, 9));
+    try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(0, 100));
+    // 10 rows -> cap 3 -> max_visible 2. Small lists that fit get all rows.
+    try std.testing.expectEqual(@as(usize, 2), computeVisibleRows(10, 100));
+    try std.testing.expectEqual(@as(usize, 2), computeVisibleRows(10, 3));
+    try std.testing.expectEqual(@as(usize, 2), computeVisibleRows(10, 2));
+    // 24 rows -> cap 8 -> max_visible 7.
+    try std.testing.expectEqual(@as(usize, 7), computeVisibleRows(24, 100));
+    try std.testing.expectEqual(@as(usize, 5), computeVisibleRows(24, 5));
+    // Lists shorter than the cap show every entry.
+    try std.testing.expectEqual(@as(usize, 1), computeVisibleRows(24, 1));
 }
 
 test "adjustView keeps cursor in the visible window" {
