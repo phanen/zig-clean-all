@@ -68,10 +68,22 @@ pub fn run(
         }
     }
 
-    // Erase the frame and return the cursor to the row above it.
-    tty.writer().writeAll("\x1b8") catch {}; // DECRC -> top of frame
-    tty.writer().writeAll(vaxis.ctlseqs.erase_below_cursor) catch {};
-    tty.writer().flush() catch {};
+    // Restore the frame area, lift the cursor back to the caller's row,
+    // and reset every terminal mode we may have touched. Without these the
+    // shell that takes over after we exit sees a hidden cursor and stale
+    // SGR attributes, so the user has to press Enter to refresh the prompt.
+    {
+        const w = tty.writer();
+        w.writeAll("\x1b8") catch {}; // DECRC -> top of frame
+        w.writeAll(vaxis.ctlseqs.erase_below_cursor) catch {};
+        w.writeAll(vaxis.ctlseqs.show_cursor) catch {};
+        w.writeAll(vaxis.ctlseqs.sgr_reset) catch {};
+        w.writeAll(vaxis.ctlseqs.bp_reset) catch {};
+        // Move cursor back to the row above the frame so the next line of
+        // output (cleanup summary, shell prompt, etc.) starts cleanly.
+        w.writeAll("\r\n") catch {};
+        w.flush() catch {};
+    }
 
     vx.screen.deinit(gpa);
     vx.screen_last.deinit(gpa);
