@@ -29,12 +29,18 @@ const NEVER_DESCEND: []const []const u8 = &.{
     "zig-pkg",
 };
 
+comptime {
+    assert(QUEUE_CAPACITY >= 16);
+    assert(QUEUE_CAPACITY & (QUEUE_CAPACITY - 1) == 0);
+}
 /// Capacity of the inline job queue. Each directory a worker encounters
 /// becomes a job; very wide trees could overflow this in principle, but in
 /// practice new jobs are consumed almost as fast as they are produced and
 /// the queue rarely holds more than a few hundred entries. When the buffer
 /// fills, workers fall back to walking the subdirectory inline rather than
-/// blocking on `put`, so progress is never lost.
+/// blocking on `put`, so progress is never lost. Power-of-two so the stack
+/// footprint stays round; floors at 16 because any smaller ring degenerates
+/// into immediate back-pressure.
 const QUEUE_CAPACITY: usize = 4096;
 
 pub const Project = struct {
@@ -55,7 +61,6 @@ const ScanJob = struct {
 /// valid for the lifetime of the scan.
 const ScanContext = struct {
     io: Io,
-    root_base: []const u8,
     skip_paths: []const []const u8,
     /// Worker arena. Must be the Zig-0.16 lock-free `ArenaAllocator`; the
     /// `init.arena` from juicy main satisfies this. All `ScanJob.abs_path`
@@ -174,7 +179,6 @@ fn findProjectsParallel(
 
     var ctx: ScanContext = .{
         .io = io,
-        .root_base = root_base,
         .skip_paths = skip_paths,
         .arena = arena,
         .queue = &queue,
@@ -370,6 +374,10 @@ test "findProjects tolerates an unreadable sub-tree" {
 
     var env = std.Io.Threaded.init(std.testing.allocator, .{});
     defer env.deinit();
+    // Lift `async_limit` past the nproc-1 default so the 4-worker run
+    // below doesn't fall back to eager execution on hosts with few cores
+    // (which would deadlock in `getOneUncancelable`).
+    env.setAsyncLimit(.limited(8));
     const io = env.io();
 
     const fixture = "/tmp/zca-scanner-unreadable";

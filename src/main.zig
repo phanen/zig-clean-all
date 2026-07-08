@@ -53,8 +53,12 @@ pub fn main(init: std.process.Init) !void {
     else
         try path.join(arena, &.{ cwd_path, opts.root_dir });
 
+    // Default to nproc, but clamp to u32 max in case some hypothetical host
+    // has more than 2^32 cores; falling back to a tiny truncated value
+    // would silently route the user to the serial walker. The user-supplied
+    // `opts.threads` is u32 and needs no clamping.
     const num_threads: u32 = if (opts.threads == 0)
-        @intCast(std.Thread.getCpuCount() catch 1)
+        std.math.cast(u32, std.Thread.getCpuCount() catch 1) orelse std.math.maxInt(u32)
     else
         opts.threads;
 
@@ -64,12 +68,10 @@ pub fn main(init: std.process.Init) !void {
     // eagerly on the caller thread, which can deadlock when the worker
     // parks in a blocking `getOne` before any job has been enqueued. Lift
     // the limit to match `num_threads` plus a small slack for the main
-    // thread and any unrelated async work. The cast is safe because the
-    // juicy-main `init.io` is always backed by `std.Io.Threaded`.
-    {
-        const threaded: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata));
-        threaded.setAsyncLimit(.limited(num_threads + 1));
-    }
+    // thread and any unrelated async work. `configureThreadedAsyncLimit`
+    // centralises the `io.userdata` cast so an audit of unsafe pointer
+    // operations has one place to look.
+    configureThreadedAsyncLimit(io, num_threads + 1);
 
     var found: std.ArrayList(scanner.Project) = .empty;
     try scanner.findProjects(io, root_dir, root_base, skip_abs, arena, &found, num_threads);
@@ -270,6 +272,11 @@ fn writeStream(io: std.Io, stream: Stream, comptime fmt: []const u8, args: anyty
     var w = file.writer(io, &buf);
     try w.interface.print(fmt, args);
     try w.interface.flush();
+}
+
+fn configureThreadedAsyncLimit(io: std.Io, limit: u32) void {
+    const threaded: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata));
+    threaded.setAsyncLimit(.limited(limit));
 }
 
 test "main module smoke" {
