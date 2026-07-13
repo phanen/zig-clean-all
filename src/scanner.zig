@@ -156,6 +156,8 @@ pub fn findProjectsAndAnalyze(
         .shards = shards,
     };
 
+    try queue.putOne(io, .{ .abs_path = root_path });
+
     var group: Io.Group = .init;
     defer group.cancel(io);
 
@@ -164,7 +166,6 @@ pub fn findProjectsAndAnalyze(
         group.async(io, workerLoop, .{ &ctx, i });
     }
 
-    try queue.putOne(io, .{ .abs_path = root_path });
     try group.await(io);
 
     for (shards) |*s| {
