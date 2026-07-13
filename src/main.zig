@@ -155,16 +155,15 @@ fn decideProceed(
     return confirmPrompt(io);
 }
 
-/// Read a single byte from stdin and return true if it is `y` or `Y`.
-/// Anything else, including EOF, returns false.
+/// Read one byte from stdin and return true for `y` or `Y`. Anything else,
+/// including EOF, returns false.
 fn confirmPrompt(io: std.Io) !bool {
     try printOut(io, "Clean the project directories shown above? [y/n] ", .{});
-    var buf: [16]u8 = undefined;
     var stdin = std.Io.File.stdin();
+    var buf: [1]u8 = undefined;
     var reader = stdin.reader(io, &buf);
-    const n = reader.interface.readSliceShort(&buf) catch return false;
-    if (n == 0) return false;
-    return buf[0] == 'y' or buf[0] == 'Y';
+    const byte = reader.interface.takeArray(1) catch return false;
+    return byte[0] == 'y' or byte[0] == 'Y';
 }
 
 /// Echo the selected projects so the user can sanity-check before the
