@@ -20,6 +20,7 @@ pub const Cli = struct {
     /// Number of worker threads to use for the parallel scanner. `0` means
     /// auto-select based on CPU count.
     threads: u32 = 0,
+    verbose: bool = false,
 };
 
 pub const ParseError = error{ InvalidArgument, UnknownFlag, MissingValue, OutOfMemory };
@@ -76,6 +77,8 @@ pub fn parse(arena: Allocator, argv: []const []const u8) ParseError!struct { Cli
                 cli.show_summary = false;
             } else if (mem.eql(u8, stripped, "interactive")) {
                 cli.interactive = true;
+            } else if (mem.eql(u8, stripped, "verbose")) {
+                cli.verbose = true;
             } else if (mem.eql(u8, stripped, "help")) {
                 help_version = .help;
             } else if (mem.eql(u8, stripped, "version")) {
@@ -112,6 +115,8 @@ pub fn parse(arena: Allocator, argv: []const []const u8) ParseError!struct { Cli
                 cli.keep_days = try parseU32(try consumeValue(argv, &i));
             } else if (mem.eql(u8, flag, "i")) {
                 cli.interactive = true;
+            } else if (mem.eql(u8, flag, "v")) {
+                cli.verbose = true;
             } else if (mem.eql(u8, flag, "h")) {
                 help_version = .help;
             } else if (mem.eql(u8, flag, "t")) {
@@ -191,6 +196,7 @@ pub const usage =
     \\  -y, --yes              Skip confirmation before cleaning
     \\  -i, --interactive      Inline multi-select TUI to toggle projects
     \\                         (falls back to y/N if not running in a TTY)
+    \\  -v, --verbose          Print skipped paths and per-op diagnostics
     \\  -s, --keep-size <SIZE> Skip projects with artifact size below SIZE
     \\                         (e.g. "10MB", "1GiB"). SI prefixes use 1000,
     \\                         binary prefixes (KiB, MiB, ...) use 1024.
@@ -224,12 +230,18 @@ test "parse defaults" {
     try std.testing.expectEqual(@as(u32, 0), out[0].keep_days);
     try std.testing.expect(out[0].show_summary);
     try std.testing.expect(!out[0].interactive);
+    try std.testing.expect(!out[0].verbose);
     try std.testing.expectEqual(@as(HelpOrVersion, .neither), out[1]);
 }
 
 test "interactive flag activates" {
     try std.testing.expect((try parseInArena(&.{"--interactive"}))[0].interactive);
     try std.testing.expect((try parseInArena(&.{"-i"}))[0].interactive);
+}
+
+test "verbose flag activates" {
+    try std.testing.expect((try parseInArena(&.{"--verbose"}))[0].verbose);
+    try std.testing.expect((try parseInArena(&.{"-v"}))[0].verbose);
 }
 
 test "parse directory and flags" {

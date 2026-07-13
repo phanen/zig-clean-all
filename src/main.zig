@@ -55,13 +55,19 @@ pub fn main(init: std.process.Init) !void {
     // cover the main thread and any unrelated async work.
     configureThreadedAsyncLimit(io, num_threads + 1);
 
-    const analyzed = try scanner.findProjectsAndAnalyze(io, root_path, skip_abs, arena, num_threads);
-    if (analyzed.items.len == 0) {
+    const scanned = try scanner.findProjectsAndAnalyze(io, root_path, skip_abs, arena, num_threads, opts.verbose);
+    if (opts.verbose and scanned.failures.len > 0) {
+        try printErr(io, "scanner skipped {d} inaccessible paths:\n", .{scanned.failures.len});
+        for (scanned.failures) |f| {
+            try printErr(io, "  - {s} ({s}:{d}): {t}\n", .{ f.path, f.fn_name, f.line, f.err });
+        }
+    }
+    if (scanned.projects.len == 0) {
         try printOut(io, "No Zig projects found under {s}\n", .{opts.root_dir});
         return;
     }
 
-    const selections = try selection.selectAll(io, arena, opts, analyzed.items);
+    const selections = try selection.selectAll(io, arena, opts, scanned.projects);
 
     var bytes_selected: u64 = 0;
     var bytes_kept: u64 = 0;

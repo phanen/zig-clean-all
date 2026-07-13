@@ -90,17 +90,20 @@ const ScanContext = struct {
     queue: *Io.Queue(ScanJob),
     pending: *Atomic.Value(u32),
     shards: []std.ArrayList(AnalyzedProject),
+    failure_shards: ?[]std.ArrayList(ScanFailure),
 };
 
 fn walkInto(ctx: *ScanContext, worker_id: u32, abs_path: []const u8) void {
-    const dir = Dir.openDirAbsolute(ctx.io, abs_path, .{ .iterate = true }) catch return;
+    const dir = Dir.openDirAbsolute(ctx.io, abs_path, .{ .iterate = true }) catch |err|
+        return recordFailure(ctx, worker_id, abs_path, err, @src());
     defer dir.close(ctx.io);
 
     var walker = Dir.walkSelectively(dir, ctx.arena) catch return;
     defer walker.deinit();
 
     while (true) {
-        const next_result = walker.next(ctx.io) catch return;
+        const next_result = walker.next(ctx.io) catch |err|
+            return recordFailure(ctx, worker_id, abs_path, err, @src());
         const entry = next_result orelse break;
 
         if (computeDescentTarget(ctx.arena, abs_path, entry, ctx.skip_paths)) |sub_abs| {
@@ -109,7 +112,10 @@ fn walkInto(ctx: *ScanContext, worker_id: u32, abs_path: []const u8) void {
             if (queued > 0) {
                 _ = ctx.pending.fetchAdd(1, .acquire);
             } else {
-                walker.enter(ctx.io, entry) catch continue;
+                walker.enter(ctx.io, entry) catch |err| {
+                    recordFailure(ctx, worker_id, sub_abs, err, @src());
+                    continue;
+                };
             }
             continue;
         }
@@ -126,6 +132,18 @@ pub const AnalyzedProject = struct {
     analysis: analyzer_mod.Analysis,
 };
 
+pub const ScanFailure = struct {
+    path: []const u8,
+    fn_name: [:0]const u8,
+    line: u32,
+    err: anyerror,
+};
+
+pub const ScanSummary = struct {
+    projects: []AnalyzedProject,
+    failures: []ScanFailure,
+};
+
 /// Fused find + analyze. Each worker that discovers a project directory
 /// opens and measures it inline before publishing the result into its own
 /// shard, so workers can keep discovering new projects while one is
@@ -136,12 +154,19 @@ pub fn findProjectsAndAnalyze(
     skip_paths: []const []const u8,
     arena: Allocator,
     num_threads: u32,
-) !std.ArrayList(AnalyzedProject) {
+    collect_failures: bool,
+) !ScanSummary {
     var results: std.ArrayList(AnalyzedProject) = .empty;
     errdefer results.deinit(arena);
 
     const shards = try arena.alloc(std.ArrayList(AnalyzedProject), num_threads);
     for (shards) |*s| s.* = .empty;
+
+    const failure_shards: ?[]std.ArrayList(ScanFailure) = if (collect_failures) blk: {
+        const fs = try arena.alloc(std.ArrayList(ScanFailure), num_threads);
+        for (fs) |*s| s.* = .empty;
+        break :blk fs;
+    } else null;
 
     var queue_buffer: [QUEUE_CAPACITY]ScanJob = undefined;
     var queue: Io.Queue(ScanJob) = .init(&queue_buffer);
@@ -154,6 +179,7 @@ pub fn findProjectsAndAnalyze(
         .queue = &queue,
         .pending = &pending,
         .shards = shards,
+        .failure_shards = failure_shards,
     };
 
     try queue.putOne(io, .{ .abs_path = root_path });
@@ -171,7 +197,19 @@ pub fn findProjectsAndAnalyze(
     for (shards) |*s| {
         try results.appendSlice(arena, s.items);
     }
-    return results;
+
+    var failure_results: std.ArrayList(ScanFailure) = .empty;
+    errdefer failure_results.deinit(arena);
+    if (failure_shards) |fs| {
+        for (fs) |*s| {
+            try failure_results.appendSlice(arena, s.items);
+        }
+    }
+
+    return .{
+        .projects = try results.toOwnedSlice(arena),
+        .failures = try failure_results.toOwnedSlice(arena),
+    };
 }
 
 fn workerLoop(ctx: *ScanContext, worker_id: u32) void {
@@ -193,12 +231,29 @@ fn analyzeAndAppend(
 ) void {
     // Reuse the walker's fd: the analyzer opens a fresh fd for each
     // child subdir, so it cannot disturb the walker's iteration position.
-    const analysis = analyzer_mod.analyze(ctx.io, project_dir, project_abs, ctx.arena) catch return;
+    const analysis = analyzer_mod.analyze(ctx.io, project_dir, project_abs, ctx.arena) catch |err|
+        return recordFailure(ctx, worker_id, project_abs, err, @src());
 
     ctx.shards[worker_id].append(ctx.arena, .{
         .project = .{ .path = project_abs },
         .analysis = analysis,
     }) catch return;
+}
+
+fn recordFailure(
+    ctx: *ScanContext,
+    worker_id: u32,
+    target_path: []const u8,
+    err: anyerror,
+    src: std.builtin.SourceLocation,
+) void {
+    const shards = ctx.failure_shards orelse return;
+    shards[worker_id].append(ctx.arena, .{
+        .path = target_path,
+        .fn_name = src.fn_name,
+        .line = src.line,
+        .err = err,
+    }) catch {};
 }
 
 fn shouldSkipDescend(basename: []const u8) bool {
@@ -278,13 +333,13 @@ test "findProjectsAndAnalyze tolerates an unreadable sub-tree" {
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
     const arena = arena_alloc.allocator();
 
-    const analyzed = try findProjectsAndAnalyze(io, fixture, &.{}, arena, 4);
+    const scanned = try findProjectsAndAnalyze(io, fixture, &.{}, arena, 4, true);
 
     // The readable project must be found; the locked one may or may not
     // show up depending on whether the walker visited it before the
     // chmod bit took effect. The contract is: must not error out.
     var found_keep = false;
-    for (analyzed.items) |a| {
+    for (scanned.projects) |a| {
         if (std.mem.indexOf(u8, a.project.path, "keep-project") != null) found_keep = true;
     }
     try std.testing.expect(found_keep);
@@ -327,7 +382,7 @@ test "parallel scanner finds each project exactly once in a deep tree" {
     // subdirs never exceed the queue capacity so there's no deadlock risk.
     var thread_count: u32 = 1;
     while (thread_count <= 4) : (thread_count += 1) {
-        const analyzed = try findProjectsAndAnalyze(io, fixture, &.{}, arena, thread_count);
-        try std.testing.expectEqual(@as(usize, branches.len), analyzed.items.len);
+        const scanned = try findProjectsAndAnalyze(io, fixture, &.{}, arena, thread_count, true);
+        try std.testing.expectEqual(@as(usize, branches.len), scanned.projects.len);
     }
 }
