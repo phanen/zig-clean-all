@@ -119,32 +119,38 @@ test "analyze swallows unreadable sub-trees instead of aborting" {
     defer env.deinit();
     const io = env.io();
 
-    const fixture_root = "/tmp/zca-analyzer-unreadable";
-    const cwd = Dir.cwd();
-    cwd.deleteTree(io, fixture_root) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try cwd.createDir(io, fixture_root, .default_dir);
-    try cwd.createDirPath(io, fixture_root ++ "/.zig-cache/locked");
-    try cwd.createDirPath(io, fixture_root ++ "/.zig-cache/open");
+    const cwd_path = try std.process.currentPathAlloc(io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd_path);
+    const fixture_root = try std.fs.path.join(std.testing.allocator, &.{
+        cwd_path, ".zig-cache", "tmp", &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(fixture_root);
+
+    try tmp.dir.createDirPath(io, ".zig-cache/locked");
+    try tmp.dir.createDirPath(io, ".zig-cache/open");
     {
-        const dir = try cwd.openDir(io, fixture_root ++ "/.zig-cache/open", .{});
+        const dir = try tmp.dir.openDir(io, ".zig-cache/open", .{});
         defer dir.close(io);
         var file = try dir.createFile(io, "ok.txt", .{});
         defer file.close(io);
         try file.writeStreamingAll(io, "fine");
     }
-    chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o000);
 
-    // Defers run in reverse: restore permissions first so the recursive
-    // deleteTree below can traverse the locked sub-tree.
-    defer cwd.deleteTree(io, fixture_root) catch {};
-    defer chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o755);
+    var lock_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_path_buf, "{s}/.zig-cache/locked", .{fixture_root}) catch unreachable;
+    chmodOrSkip(lock_path, 0o000);
+
+    // Restore mode before tmp.cleanup so deleteTree can enter.
+    defer chmodOrSkip(lock_path, 0o755);
 
     var arena_buf: [65536]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
     const arena = arena_alloc.allocator();
 
-    const pdir = try cwd.openDir(io, fixture_root, .{ .iterate = true });
+    const pdir = try tmp.dir.openDir(io, ".", .{ .iterate = true });
     defer pdir.close(io);
 
     const analysis = try analyze(io, pdir, fixture_root, arena);

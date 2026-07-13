@@ -241,31 +241,38 @@ test "findProjectsAndAnalyze tolerates an unreadable sub-tree" {
     env.setAsyncLimit(.limited(8));
     const io = env.io();
 
-    const fixture = "/tmp/zca-scanner-unreadable";
-    const cwd = Dir.cwd();
-    cwd.deleteTree(io, fixture) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_path = try std.process.currentPathAlloc(io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd_path);
+    const fixture = try std.fs.path.join(std.testing.allocator, &.{
+        cwd_path, ".zig-cache", "tmp", &tmp.sub_path,
+    });
+    defer std.testing.allocator.free(fixture);
 
-    try cwd.createDir(io, fixture, .default_dir);
-    try cwd.createDirPath(io, fixture ++ "/keep-project");
-    try cwd.createDirPath(io, fixture ++ "/lock-project/locked-deep");
+    try tmp.dir.createDirPath(io, "keep-project");
+    try tmp.dir.createDirPath(io, "lock-project/locked-deep");
     {
-        const keep_dir = try cwd.openDir(io, fixture ++ "/keep-project", .{});
+        const keep_dir = try tmp.dir.openDir(io, "keep-project", .{});
         defer keep_dir.close(io);
         var f = try keep_dir.createFile(io, "build.zig", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "// stub");
     }
     {
-        const lock_dir = try cwd.openDir(io, fixture ++ "/lock-project", .{});
+        const lock_dir = try tmp.dir.openDir(io, "lock-project", .{});
         defer lock_dir.close(io);
         var f = try lock_dir.createFile(io, "build.zig", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "// stub");
     }
-    chmodOrSkip(fixture ++ "/lock-project", 0o000);
 
-    defer chmodOrSkip(fixture ++ "/lock-project", 0o755);
-    defer cwd.deleteTree(io, fixture) catch {};
+    var lock_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_path_buf, "{s}/lock-project", .{fixture}) catch unreachable;
+    chmodOrSkip(lock_path, 0o000);
+
+    // Restore mode before tmp.cleanup so the recursive deleteTree can enter.
+    defer chmodOrSkip(lock_path, 0o755);
 
     var arena_buf: [1 * 1024 * 1024]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
@@ -289,30 +296,32 @@ test "parallel scanner finds each project exactly once in a deep tree" {
     env.setAsyncLimit(.limited(8));
     const io = env.io();
 
-    // FixedBufferAllocator corrupts under concurrent allocation; the
-    // thread-safe ArenaAllocator is required.
+    // ArenaAllocator is required under concurrent allocation; the
+    // FixedBufferAllocator corrupts when shared across worker threads.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const fixture = "/tmp/zca-scanner-parallel";
-    const cwd = Dir.cwd();
-    cwd.deleteTree(io, fixture) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try cwd.createDir(io, fixture, .default_dir);
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
+    const fixture = try std.fs.path.join(arena, &.{
+        cwd_path, ".zig-cache", "tmp", &tmp.sub_path,
+    });
+
     const branches = [_][]const u8{ "alpha", "beta", "gamma", "delta" };
     for (branches) |b| {
-        const deep_path = try std.fs.path.join(arena, &.{ fixture, b, "nested", "deep" });
-        try cwd.createDirPath(io, deep_path);
+        const deep_path = try std.fs.path.join(arena, &.{ b, "nested", "deep" });
+        try tmp.dir.createDirPath(io, deep_path);
         {
-            const dir = try cwd.openDir(io, deep_path, .{});
+            const dir = try tmp.dir.openDir(io, deep_path, .{});
             defer dir.close(io);
             var f = try dir.createFile(io, "build.zig", .{});
             defer f.close(io);
             try f.writeStreamingAll(io, "// stub");
         }
     }
-    defer cwd.deleteTree(io, fixture) catch {};
 
     // Exercise the queue-fallback path with several thread counts; four
     // subdirs never exceed the queue capacity so there's no deadlock risk.

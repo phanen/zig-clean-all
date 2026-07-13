@@ -165,21 +165,21 @@ test "cleanAll no-op on missing artifact directories" {
     defer env.deinit();
     const io = env.io();
 
-    const fake_root = "/tmp/zca-cleaner-missing";
-    const cwd = Dir.cwd();
-    cwd.deleteTree(io, fake_root) catch {};
-    try cwd.createDir(io, fake_root, .default_dir);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     var arena_buf: [4096]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
     const arena = arena_alloc.allocator();
 
-    const paths = [_][]const u8{fake_root};
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
+    const project_path = try std.fs.path.join(arena, &.{
+        cwd_path, ".zig-cache", "tmp", &tmp.sub_path,
+    });
+    const paths = [_][]const u8{project_path};
     const summary = try cleanAll(io, arena, &paths, false);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expectEqual(@as(usize, 0), summary.failed.len);
-
-    cwd.deleteTree(io, fake_root) catch {};
 }
 
 test "emptyDir removes file contents" {
@@ -187,32 +187,21 @@ test "emptyDir removes file contents" {
     defer env.deinit();
     const io = env.io();
 
-    const fixture_root = "/tmp/zca-empty-test";
-    const artifact_rel = ".zig-cache";
-    const cwd = Dir.cwd();
-    cwd.deleteTree(io, fixture_root) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    try cwd.createDir(io, fixture_root, .default_dir);
-    try cwd.createDirPath(io, fixture_root ++ "/" ++ artifact_rel);
+    const artifact_rel = ".zig-cache";
+    try tmp.dir.createDirPath(io, artifact_rel);
     {
-        const dir = try cwd.openDir(io, fixture_root, .{});
-        defer dir.close(io);
-        var file = try dir.createFile(io, ".zig-cache/file.txt", .{});
+        var file = try tmp.dir.createFile(io, artifact_rel ++ "/file.txt", .{});
         defer file.close(io);
         try file.writeStreamingAll(io, "hello");
     }
 
-    {
-        const dir = try cwd.openDir(io, fixture_root, .{});
-        try emptyDir(io, dir, artifact_rel);
-    }
+    try emptyDir(io, tmp.dir, artifact_rel);
 
-    const dir_after = try cwd.openDir(io, fixture_root, .{});
-    defer dir_after.close(io);
-    const sub = try dir_after.openDir(io, artifact_rel, .{ .iterate = true });
+    const sub = try tmp.dir.openDir(io, artifact_rel, .{ .iterate = true });
     defer sub.close(io);
     var iter = sub.iterate();
     try std.testing.expect(try iter.next(io) == null);
-
-    cwd.deleteTree(io, fixture_root) catch {};
 }
