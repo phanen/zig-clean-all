@@ -1,8 +1,5 @@
-//! CLI argument parsing for zig-clean-all.
-//!
-//! Owns no allocations of its own: the caller supplies an arena that backs
-//! the slices in `Cli` (notably `ignore_paths` and `skip_paths`). Parsing is
-//! total and returns `error.InvalidArgument` (or friends) on failure.
+//! CLI argument parsing. The caller supplies an arena that backs the slices
+//! in `Cli` (notably `ignore_paths` and `skip_paths`).
 
 const std = @import("std");
 const mem = std.mem;
@@ -25,12 +22,7 @@ pub const Cli = struct {
     threads: u32 = 0,
 };
 
-pub const ParseError = error{
-    InvalidArgument,
-    UnknownFlag,
-    MissingValue,
-    OutOfMemory,
-};
+pub const ParseError = error{ InvalidArgument, UnknownFlag, MissingValue, OutOfMemory };
 
 pub const HelpOrVersion = enum { neither, help, version };
 
@@ -53,10 +45,7 @@ const SIZE_SUFFIXES: []const Suffix = &.{
 
 /// Parse argv (without the program name). Returns the populated `Cli` plus
 /// a `HelpOrVersion` if `--help`/`-h`/`--version` was seen.
-pub fn parse(
-    arena: Allocator,
-    argv: []const []const u8,
-) ParseError!struct { Cli, HelpOrVersion } {
+pub fn parse(arena: Allocator, argv: []const []const u8) ParseError!struct { Cli, HelpOrVersion } {
     var cli: Cli = .{};
     var ignore_list: std.ArrayList([]const u8) = .empty;
     var skip_list: std.ArrayList([]const u8) = .empty;
@@ -144,18 +133,17 @@ pub fn parse(
     return .{ cli, help_version };
 }
 
-/// Read the next argv slot, advancing `i` past it. Caller is responsible for
-/// the trailing `: (i += 1)` of the parse loop, so this leaves `i` pointing
-/// at the consumed value.
+/// Read the next argv slot. The parse loop's own `: (i += 1)` advances past
+/// the consumed value on the next iteration.
 fn consumeValue(argv: []const []const u8, i: *usize) ParseError![]const u8 {
     if (i.* + 1 >= argv.len) return ParseError.MissingValue;
     i.* += 1;
     return argv[i.*];
 }
 
-/// Parse a byte size like "10MB", "1GiB", "1024", "2.5GB" into a u64.
-/// Decimal SI prefixes (`kB`, `MB`, ...) use 1000; binary prefixes (`KiB`,
-/// `MiB`, ...) use 1024. Suffixes are case-sensitive for the binary form.
+/// Parse a byte size like "10MB", "1GiB", "1024", "2.5GB". SI prefixes
+/// (`kB`, `MB`, ...) use 1000; binary prefixes (`KiB`, `MiB`, ...) use 1024
+/// and are matched case-sensitively.
 pub fn parseBytes(text: []const u8) ParseError!u64 {
     if (text.len == 0) return ParseError.InvalidArgument;
 
@@ -219,11 +207,16 @@ pub const usage =
     \\
 ;
 
-test "parse defaults" {
+/// Backed by a fixed buffer; large enough for the argv sizes used in
+/// tests. Lets each test invoke `parse` without repeating the boilerplate.
+fn parseInArena(argv: []const []const u8) !struct { Cli, HelpOrVersion } {
     var arena_buf: [4096]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const out = try parse(arena, &.{});
+    return try parse(arena_alloc.allocator(), argv);
+}
+
+test "parse defaults" {
+    const out = try parseInArena(&.{});
     try std.testing.expectEqualStrings(".", out[0].root_dir);
     try std.testing.expect(!out[0].yes);
     try std.testing.expect(!out[0].dry_run);
@@ -235,24 +228,13 @@ test "parse defaults" {
 }
 
 test "interactive flag activates" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const long_argv = [_][]const u8{"--interactive"};
-    const out_long = try parse(arena, &long_argv);
-    try std.testing.expect(out_long[0].interactive);
-
-    const short_argv = [_][]const u8{"-i"};
-    const out_short = try parse(arena, &short_argv);
-    try std.testing.expect(out_short[0].interactive);
+    try std.testing.expect((try parseInArena(&.{"--interactive"}))[0].interactive);
+    try std.testing.expect((try parseInArena(&.{"-i"}))[0].interactive);
 }
 
 test "parse directory and flags" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--yes", "--keep-days", "7", "-s", "10MB", "/tmp" };
-    const out = try parse(arena, &argv);
+    const out = try parseInArena(&argv);
     try std.testing.expectEqualStrings("/tmp", out[0].root_dir);
     try std.testing.expect(out[0].yes);
     try std.testing.expectEqual(@as(u32, 7), out[0].keep_days);
@@ -274,32 +256,21 @@ test "parse rejects garbage" {
 }
 
 test "unknown flag is rejected" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const argv = [_][]const u8{"--no-such-flag"};
-    try std.testing.expectError(ParseError.UnknownFlag, parse(arena, &argv));
+    try std.testing.expectError(ParseError.UnknownFlag, parseInArena(&.{"--no-such-flag"}));
 }
 
 test "missing value is rejected" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const argv = [_][]const u8{"--keep-size"};
-    try std.testing.expectError(ParseError.MissingValue, parse(arena, &argv));
+    try std.testing.expectError(ParseError.MissingValue, parseInArena(&.{"--keep-size"}));
 }
 
 test "ignore and skip accumulate" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{
         "--ignore", "a",
         "--ignore", "b",
         "--skip",   "c",
         ".",
     };
-    const out = try parse(arena, &argv);
+    const out = try parseInArena(&argv);
     try std.testing.expectEqual(@as(usize, 2), out[0].ignore_paths.len);
     try std.testing.expectEqual(@as(usize, 1), out[0].skip_paths.len);
     try std.testing.expectEqualStrings("a", out[0].ignore_paths[0]);
@@ -307,39 +278,23 @@ test "ignore and skip accumulate" {
 }
 
 test "--help is detected" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const argv = [_][]const u8{"--help"};
-    const out = try parse(arena, &argv);
-    try std.testing.expectEqual(@as(HelpOrVersion, .help), out[1]);
+    try std.testing.expectEqual(@as(HelpOrVersion, .help), (try parseInArena(&.{"--help"}))[1]);
 }
 
 test "--version is detected" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
-    const argv = [_][]const u8{"--version"};
-    const out = try parse(arena, &argv);
-    try std.testing.expectEqual(@as(HelpOrVersion, .version), out[1]);
+    try std.testing.expectEqual(@as(HelpOrVersion, .version), (try parseInArena(&.{"--version"}))[1]);
 }
 
 test "double dash stops flag parsing" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--yes", "--", "--not-a-flag" };
-    const out = try parse(arena, &argv);
+    const out = try parseInArena(&argv);
     try std.testing.expect(out[0].yes);
     try std.testing.expectEqualStrings("--not-a-flag", out[0].root_dir);
 }
 
 test "keep-size and keep-days inline form" {
-    var arena_buf: [4096]u8 = undefined;
-    var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
-    const arena = arena_alloc.allocator();
     const argv = [_][]const u8{ "--keep-size=2MiB", "--keep-days=3", "." };
-    const out = try parse(arena, &argv);
+    const out = try parseInArena(&argv);
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), out[0].keep_size_bytes);
     try std.testing.expectEqual(@as(u32, 3), out[0].keep_days);
     try std.testing.expectEqualStrings(".", out[0].root_dir);

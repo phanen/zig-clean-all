@@ -1,15 +1,10 @@
 //! Measures a project's build artifacts so the caller can decide whether
-//! to wipe them.
-//!
-//! "Artifacts" for a Zig project are `.zig-cache`, `zig-out`, and `zig-pkg`.
-//! The analyzer walks each one that exists, sums the bytes, and records the
-//! most recent modification time found in any descendant. Symlinks are not
-//! followed - they would invite both cycles and double-counting.
+//! to wipe them. Artifacts are `.zig-cache`, `zig-out`, and `zig-pkg`.
+//! Symlinks are not followed - they would invite both cycles and
+//! double-counting.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fs = std.fs;
-const path = fs.path;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -18,7 +13,7 @@ const ARTIFACT_NAMES: []const []const u8 = &.{ ".zig-cache", "zig-out", "zig-pkg
 
 pub const Analysis = struct {
     /// Absolute paths of artifact directories that exist under the project.
-    /// Allocated by `arena`. Order matches the order in `ARTIFACT_NAMES`.
+    /// Allocated by `arena`, in `ARTIFACT_NAMES` order.
     artifact_paths: []const []const u8,
     /// Sum of sizes of every regular file under every artifact directory.
     /// Zero if no artifact exists.
@@ -28,8 +23,7 @@ pub const Analysis = struct {
     last_modified_ns: i128,
 };
 
-/// Open `project_dir` and measure its build artifacts. The caller is
-/// responsible for the project directory handle.
+/// Open `project_dir` and measure its build artifacts.
 pub fn analyze(
     io: Io,
     project_dir: Dir,
@@ -54,9 +48,6 @@ pub fn analyze(
     };
 }
 
-/// Open one artifact sub-directory, record its absolute path, and walk it to
-/// tally size and mtime. Returns silently with `out` left at zero when the
-/// artifact does not exist.
 fn measureArtifact(
     io: Io,
     project_dir: Dir,
@@ -84,8 +75,7 @@ const Measure = struct {
     const zero: Measure = .{ .total_size = 0, .latest_ns = 0 };
 };
 
-/// Best-effort chmod used by fixture setup. `std.os.linux.chmod` returns a
-/// raw syscall result, so wrap it and swallow any error so the test
+/// Best-effort chmod used by fixture setup. Swallows errors so the test
 /// continues even when the kernel refuses (for example in a sandbox).
 fn chmodOrSkip(raw_path: []const u8, mode: u32) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -93,15 +83,10 @@ fn chmodOrSkip(raw_path: []const u8, mode: u32) void {
     _ = std.os.linux.chmod(z_path, mode);
 }
 
-/// Recursive visitor that counts bytes and tracks the maximum mtime. The
-/// walker deliberately stops at symlinks to avoid loops and double counting.
-/// `arena` backs the walker's internal stack so callers don't need a
-/// long-lived allocator for the duration of the measurement.
-///
-/// I/O errors that bubble up from `walker.next` (for example an
-/// `AccessDenied` deep inside a sub-tree we cannot enter) are swallowed:
-/// the partial measure collected so far is still useful, and a single
-/// unreadable sub-tree should never abort the whole scan.
+/// Walk `dir` and tally the size and latest mtime of every regular file.
+/// Symlinks are skipped (the walker doesn't follow them) to avoid cycles.
+/// I/O errors from individual entries are swallowed so a single unreadable
+/// sub-tree cannot abort the whole scan.
 fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
     var walker = Dir.walkSelectively(dir, arena) catch return;
     defer walker.deinit();
@@ -109,12 +94,10 @@ fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
     while (true) {
         const next_result = walker.next(io) catch break;
         const entry = next_result orelse break;
-        if (entry.kind == .sym_link) continue;
         switch (entry.kind) {
             .file => {
                 // `entry.dir` is the containing directory of each entry,
-                // not the original root. Statting against the outer `dir`
-                // would miss every nested file.
+                // not the original root, so statting must use it directly.
                 const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
                 out.total_size += stat.size;
                 const ns: i128 = stat.mtime.nanoseconds;
@@ -127,7 +110,8 @@ fn measureDir(io: Io, dir: Dir, arena: Allocator, out: *Measure) anyerror!void {
 }
 
 test "analyze swallows unreadable sub-trees instead of aborting" {
-    // Skip when running as root, because root bypasses mode bits.
+    // Root bypasses mode bits, so the chmod-based fixture cannot
+    // produce AccessDenied for it.
     if (builtin.os.tag != .linux) return;
     if (std.os.linux.geteuid() == 0) return;
 
@@ -152,7 +136,7 @@ test "analyze swallows unreadable sub-trees instead of aborting" {
     chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o000);
 
     // Defers run in reverse: restore permissions first so the recursive
-    // deleteTree below can actually traverse the locked sub-tree.
+    // deleteTree below can traverse the locked sub-tree.
     defer cwd.deleteTree(io, fixture_root) catch {};
     defer chmodOrSkip(fixture_root ++ "/.zig-cache/locked", 0o755);
 
@@ -163,8 +147,6 @@ test "analyze swallows unreadable sub-trees instead of aborting" {
     const pdir = try cwd.openDir(io, fixture_root, .{ .iterate = true });
     defer pdir.close(io);
 
-    // Must NOT error: the analyzer should report only what it could read
-    // and silently skip the locked sub-tree.
     const analysis = try analyze(io, pdir, fixture_root, arena);
     try std.testing.expectEqual(@as(usize, 1), analysis.artifact_paths.len);
     try std.testing.expect(analysis.total_size_bytes > 0);

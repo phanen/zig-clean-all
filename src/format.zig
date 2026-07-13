@@ -1,6 +1,6 @@
 //! Human-readable formatting for byte sizes and unix nanosecond timestamps.
-//! All functions write into caller-provided buffers to keep allocation
-//! patterns predictable for a tool that may run over millions of files.
+//! Functions write into caller-provided buffers to keep allocation patterns
+//! predictable.
 
 const std = @import("std");
 
@@ -14,7 +14,7 @@ const DAYS_PER_100Y: i128 = 36_524;
 const DAYS_PER_400Y: i128 = 146_096;
 
 /// Render `bytes` as a short decimal string like "1.5 GB" or "938 B".
-/// Uses SI (1000-based) units. Returns the number of bytes written.
+/// SI (1000-based) units. Returns the number of bytes written.
 pub fn formatBytes(buf: []u8, bytes: u64) usize {
     if (bytes < 1000) {
         return (std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch return 0).len;
@@ -32,19 +32,17 @@ pub fn formatBytes(buf: []u8, bytes: u64) usize {
     return (std.fmt.bufPrint(buf, "{d:.2} TB", .{value_f / 1_000_000_000_000}) catch return 0).len;
 }
 
-/// Render `nanoseconds` (since Unix epoch) as a short ISO-style date
-/// "YYYY-MM-DD HH:MM" in UTC. Returns bytes written; 0 on overflow.
+/// Render Unix-epoch nanoseconds as "YYYY-MM-DD HH:MM" in UTC. Returns
+/// bytes written; 0 on overflow.
 pub fn formatTimestamp(buf: []u8, nanoseconds: i128) usize {
     if (nanoseconds <= 0) return (std.fmt.bufPrint(buf, "never", .{}) catch return 0).len;
 
     var secs: i128 = @divTrunc(nanoseconds, NS_PER_S);
     if (secs < 0) secs = 0;
 
-    // Howard Hinnant's days_from_civil; inverse of days_from_civil via a
-    // direct conversion. We only need the date portion, not time-of-day
-    // precision beyond minutes.
-    // Offset from civil-from-days epoch (0000-03-01) to Unix epoch. The Hinnant
-    // algorithms assume the input is in civil days, not Unix days.
+    // Howard Hinnant's days_from_civil; the offset translates the Unix
+    // epoch into the civil-from-days epoch (0000-03-01) the algorithm
+    // expects.
     const CIVIL_EPOCH_OFFSET: i128 = 719_468;
     const z: i128 = @divTrunc(secs, SECS_PER_DAY) + CIVIL_EPOCH_OFFSET;
     const secs_of_day: i128 = @mod(secs, SECS_PER_DAY);
@@ -73,26 +71,6 @@ pub fn formatTimestamp(buf: []u8, nanoseconds: i128) usize {
     ) catch return 0).len;
 }
 
-/// Render `nanoseconds` (relative to "now") as "Nd Nh Nm" or "Nh Nm" etc.
-/// Returns bytes written.
-pub fn formatAge(buf: []u8, age_ns: i128) usize {
-    if (age_ns <= 0) return (std.fmt.bufPrint(buf, "now", .{}) catch return 0).len;
-    var secs: i128 = @divTrunc(age_ns, NS_PER_S);
-    const days = @divFloor(secs, SECS_PER_DAY);
-    secs -= days * SECS_PER_DAY;
-    const hours = @divFloor(secs, SECS_PER_HOUR);
-    secs -= hours * SECS_PER_HOUR;
-    const mins = @divFloor(secs, SECS_PER_MIN);
-
-    if (days > 0) {
-        return (std.fmt.bufPrint(buf, "{d}d {d}h {d}m", .{ days, hours, mins }) catch return 0).len;
-    }
-    if (hours > 0) {
-        return (std.fmt.bufPrint(buf, "{d}h {d}m", .{ hours, mins }) catch return 0).len;
-    }
-    return (std.fmt.bufPrint(buf, "{d}m", .{mins}) catch return 0).len;
-}
-
 test "formatBytes uses sensible units" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("0 B", buf[0..formatBytes(&buf, 0)]);
@@ -104,17 +82,6 @@ test "formatBytes uses sensible units" {
 
 test "formatTimestamp renders a known epoch" {
     var buf: [32]u8 = undefined;
-    // 2024-01-01 00:00:00 UTC -> 1704067200
     const rendered = buf[0..formatTimestamp(&buf, 1704067200 * NS_PER_S)];
     try std.testing.expectEqualStrings("2024-01-01 00:00", rendered);
-}
-
-test "formatAge degrades gracefully" {
-    var buf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("now", buf[0..formatAge(&buf, 0)]);
-    try std.testing.expectEqualStrings("5m", buf[0..formatAge(&buf, 5 * 60 * NS_PER_S)]);
-    try std.testing.expectEqualStrings(
-        "3d 4h 5m",
-        buf[0..formatAge(&buf, (3 * SECS_PER_DAY + 4 * SECS_PER_HOUR + 5 * SECS_PER_MIN) * NS_PER_S)],
-    );
 }

@@ -2,11 +2,11 @@ const std = @import("std");
 const path = std.fs.path;
 const cli = @import("cli.zig");
 const scanner = @import("scanner.zig");
-const analyzer = @import("analyzer.zig");
 const selection = @import("selection.zig");
 const format = @import("format.zig");
 const cleaner = @import("cleaner.zig");
 const interactive_mod = @import("interactive.zig");
+const path_util = @import("path_util.zig");
 
 const version = "0.1.0";
 
@@ -34,64 +34,46 @@ pub fn main(init: std.process.Init) !void {
         .neither => {},
     }
 
-    const cwd = std.Io.Dir.cwd();
     const cwd_path = try std.process.currentPathAlloc(io, arena);
 
-    opts.ignore_paths = try scanner.resolveSkipPaths(cwd_path, opts.ignore_paths, arena);
-    const skip_abs = try scanner.resolveSkipPaths(cwd_path, opts.skip_paths, arena);
+    opts.ignore_paths = try path_util.resolvePaths(cwd_path, opts.ignore_paths, arena);
+    const skip_abs = try path_util.resolvePaths(cwd_path, opts.skip_paths, arena);
 
-    const root_dir = try cwd.openDir(io, opts.root_dir, .{ .iterate = true });
-    defer root_dir.close(io);
-    // Must be absolute: the parallel walker hands `root_base` to
-    // `Dir.openDirAbsolute` from worker threads, which asserts it.
-    const root_base = try path.resolve(arena, &.{ cwd_path, opts.root_dir });
+    // Resolved once so every worker sees the same absolute path.
+    const root_path = try path.resolve(arena, &.{ cwd_path, opts.root_dir });
 
-    // Default to nproc, but clamp to u32 max in case some hypothetical host
-    // has more than 2^32 cores; falling back to a tiny truncated value
-    // would silently route the user to the serial walker. The user-supplied
-    // `opts.threads` is u32 and needs no clamping.
+    // `getCpuCount` returns usize; clamp to u32 so the same field can carry
+    // both the default and the user-supplied value.
     const num_threads: u32 = if (opts.threads == 0)
         std.math.cast(u32, std.Thread.getCpuCount() catch 1) orelse std.math.maxInt(u32)
     else
         opts.threads;
 
-    // The Threaded Io backend defaults its `async_limit` to `nproc - 1` so
-    // there is always at least one CPU left for the main thread. Spawning
-    // more workers than that limit causes the over-the-limit calls to run
-    // eagerly on the caller thread, which can deadlock when the worker
-    // parks in a blocking `getOne` before any job has been enqueued. Lift
-    // the limit to match `num_threads` plus a small slack for the main
-    // thread and any unrelated async work. `configureThreadedAsyncLimit`
-    // centralises the `io.userdata` cast so an audit of unsafe pointer
-    // operations has one place to look.
+    // Threaded defaults async_limit to nproc-1. Workers that exceed it run
+    // eagerly on the caller thread, which deadlocks when a worker parks in
+    // `getOne` before the seed job is enqueued. Lift past num_threads to
+    // cover the main thread and any unrelated async work.
     configureThreadedAsyncLimit(io, num_threads + 1);
 
-    var found: std.ArrayList(scanner.Project) = .empty;
-    try scanner.findProjects(io, root_dir, root_base, skip_abs, arena, &found, num_threads);
-    if (found.items.len == 0) {
+    const analyzed = try scanner.findProjectsAndAnalyze(io, root_path, skip_abs, arena, num_threads);
+    if (analyzed.items.len == 0) {
         try printOut(io, "No Zig projects found under {s}\n", .{opts.root_dir});
         return;
     }
 
-    var items: std.ArrayList(selection.Item) = .empty;
-    for (found.items) |p| {
-        const pdir = cwd.openDir(io, p.path, .{ .iterate = true }) catch |err| {
-            try printErr(io, "could not open {s}: {t}\n", .{ p.path, err });
-            continue;
-        };
-        defer pdir.close(io);
-        const a = analyzer.analyze(io, pdir, p.path, arena) catch |err| {
-            try printErr(io, "could not analyze {s}: {t}\n", .{ p.path, err });
-            continue;
-        };
-        try items.append(arena, .{ .project = p, .analysis = a });
+    const selections = try selection.selectAll(io, arena, opts, analyzed.items);
+
+    var bytes_selected: u64 = 0;
+    var bytes_kept: u64 = 0;
+    var count_selected: usize = 0;
+    for (selections) |s| {
+        if (s.selected) {
+            bytes_selected += s.item.analysis.total_size_bytes;
+            count_selected += 1;
+        } else {
+            bytes_kept += s.item.analysis.total_size_bytes;
+        }
     }
-
-    const selections = try selection.selectAll(io, arena, opts, items.items);
-
-    const bytes_selected: u64 = totalSelectedBytes(selections);
-    const bytes_kept: u64 = totalKeptBytes(selections);
-    const count_selected = countSelected(selections);
     if (opts.show_summary) {
         var freed_buf: [128]u8 = undefined;
         var kept_buf: [128]u8 = undefined;
@@ -107,14 +89,10 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    // In non-interactive mode the user only sees the summary line, which
-    // doesn't tell them which projects are about to be removed. Dump the
-    // selected entries so they can sanity-check before answering y/N. The
-    // interactive TUI shows the same list inline, so skip it there.
-    if (count_selected > 0) {
-        if (!opts.interactive) {
-            try printSelectionList(io, selections);
-        }
+    // Non-interactive mode skips the TUI listing, so echo the selection
+    // here so the user can sanity-check before answering y/N.
+    if (count_selected > 0 and !opts.interactive) {
+        try printSelectionList(io, selections);
     }
 
     if (opts.dry_run) {
@@ -158,9 +136,8 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// Returns true if the user wants to proceed with cleanup. Honors `--yes`,
-/// drives the interactive TUI when `--interactive` is set, and falls back to
-/// a y/N prompt otherwise.
+/// Decide whether the user wants to proceed. Honors `--yes`, drives the
+/// interactive TUI when `--interactive` is set, and falls back to y/N.
 fn decideProceed(
     io: std.Io,
     opts: cli.Cli,
@@ -178,8 +155,8 @@ fn decideProceed(
     return confirmPrompt(io);
 }
 
-/// Read a single line from stdin and return true if it starts with 'y' or
-/// 'Y'. Anything else (including EOF) returns false.
+/// Read a single byte from stdin and return true if it is `y` or `Y`.
+/// Anything else, including EOF, returns false.
 fn confirmPrompt(io: std.Io) !bool {
     try printOut(io, "Clean the project directories shown above? [y/n] ", .{});
     var buf: [16]u8 = undefined;
@@ -190,36 +167,9 @@ fn confirmPrompt(io: std.Io) !bool {
     return buf[0] == 'y' or buf[0] == 'Y';
 }
 
-fn countSelected(s: []const selection.Selection) usize {
-    var n: usize = 0;
-    for (s) |x| {
-        if (x.selected) n += 1;
-    }
-    return n;
-}
-
-fn totalSelectedBytes(s: []const selection.Selection) u64 {
-    var total: u64 = 0;
-    for (s) |x| {
-        if (x.selected) total += x.item.analysis.total_size_bytes;
-    }
-    return total;
-}
-
-fn totalKeptBytes(s: []const selection.Selection) u64 {
-    var total: u64 = 0;
-    for (s) |x| {
-        if (!x.selected) total += x.item.analysis.total_size_bytes;
-    }
-    return total;
-}
-
-/// Write the list of projects that will be cleaned, one per line, under a
-/// "Selected the following project directories for cleaning:" heading.
-/// Each entry's basename is wrapped in ANSI green so the project name
-/// stands out from its full path and size. Buffered through a single
-/// writer so a long list doesn't trigger a flush per entry. A trailing
-/// blank line separates the listing from whatever follows.
+/// Echo the selected projects so the user can sanity-check before the
+/// confirmation prompt. Buffer through one writer so a long list doesn't
+/// trigger a flush per entry.
 fn printSelectionList(
     io: std.Io,
     selections: []const selection.Selection,
@@ -270,8 +220,4 @@ fn writeStream(io: std.Io, stream: Stream, comptime fmt: []const u8, args: anyty
 fn configureThreadedAsyncLimit(io: std.Io, limit: u32) void {
     const threaded: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata));
     threaded.setAsyncLimit(.limited(limit));
-}
-
-test "main module smoke" {
-    try std.testing.expect(true);
 }

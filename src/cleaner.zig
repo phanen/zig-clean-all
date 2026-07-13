@@ -1,6 +1,6 @@
 //! Remove the artifact directories that the selection has flagged for
-//! cleanup. Supports a `--keep-empty` mode that empties each artifact
-//! directory in place rather than removing the directory itself.
+//! cleanup. With `--keep-empty` the artifact directory is emptied in place
+//! rather than removed.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -23,9 +23,9 @@ pub const Summary = struct {
 
 const Outcome = enum { removed, emptied, skipped };
 
-/// Delete every artifact directory listed in `selections`. Returns a summary
-/// the caller can use to print a final report. Failures on individual
-/// artifacts are accumulated and returned instead of aborting the run.
+/// Delete every artifact directory under `project_paths`. Per-artifact
+/// failures are accumulated in `Summary.failed` so a partial failure never
+/// aborts the rest of the run.
 pub fn cleanAll(
     io: Io,
     arena: Allocator,
@@ -39,11 +39,7 @@ pub fn cleanAll(
 
     for (project_paths) |project| {
         const project_dir = cwd.openDir(io, project, .{ .iterate = true }) catch |err| {
-            try failures.append(arena, .{
-                .project_path = project,
-                .artifact_name = "<project>",
-                .err = err,
-            });
+            try recordFailure(arena, &failures, project, "<project>", err);
             continue;
         };
         defer project_dir.close(io);
@@ -64,8 +60,6 @@ pub fn cleanAll(
     };
 }
 
-/// Process a single artifact sub-directory: either delete it or empty it in
-/// place. Returns `.skipped` when the artifact does not exist.
 fn cleanOne(
     io: Io,
     project_dir: Dir,
@@ -113,10 +107,10 @@ fn recordFailure(
     });
 }
 
-/// Remove every child of `parent/name` while keeping `parent/name` itself
-/// in place. Walks the subtree via a manual stack to avoid pulling in a
-/// per-delete allocation. When the local stack overflows the deepest
-/// sub-tree, falls back to `deleteTree` which uses its own internal stack.
+/// Remove every child of `parent/name` while keeping `parent/name` itself.
+/// Walks via a small inline stack so most directories need no allocation.
+/// When the local stack runs out, fall back to `deleteTree` which uses its
+/// own stack buffer.
 fn emptyDir(io: Io, parent: Dir, name: []const u8) anyerror!void {
     const StackItem = struct {
         dir: Dir,
@@ -157,8 +151,6 @@ fn emptyDir(io: Io, parent: Dir, name: []const u8) anyerror!void {
                     }) catch continue;
                     stack.appendAssumeCapacity(.{ .dir = sub, .iter = sub.iterateAssumeFirstIteration() });
                 } else {
-                    // Out of local stack - fall back to deleteTree which uses
-                    // its own stack buffer.
                     top.dir.deleteTree(io, entry.name) catch continue;
                 }
             },
@@ -174,9 +166,9 @@ test "cleanAll no-op on missing artifact directories" {
     const io = env.io();
 
     const fake_root = "/tmp/zca-cleaner-missing";
-    std.Io.Dir.cwd().deleteTree(io, fake_root) catch {};
-    try std.Io.Dir.cwd().createDir(io, fake_root, .default_dir);
-    try std.Io.Dir.cwd().createDirPath(io, fake_root ++ "/build.zig.touch");
+    const cwd = Dir.cwd();
+    cwd.deleteTree(io, fake_root) catch {};
+    try cwd.createDir(io, fake_root, .default_dir);
 
     var arena_buf: [4096]u8 = undefined;
     var arena_alloc = std.heap.FixedBufferAllocator.init(&arena_buf);
@@ -187,7 +179,7 @@ test "cleanAll no-op on missing artifact directories" {
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expectEqual(@as(usize, 0), summary.failed.len);
 
-    std.Io.Dir.cwd().deleteTree(io, fake_root) catch {};
+    cwd.deleteTree(io, fake_root) catch {};
 }
 
 test "emptyDir removes file contents" {
@@ -195,10 +187,8 @@ test "emptyDir removes file contents" {
     defer env.deinit();
     const io = env.io();
 
-    // Build a tiny fixture: /tmp/zca-empty-test/{.zig-cache/file.txt}
     const fixture_root = "/tmp/zca-empty-test";
     const artifact_rel = ".zig-cache";
-    const file_rel = ".zig-cache/file.txt";
     const cwd = Dir.cwd();
     cwd.deleteTree(io, fixture_root) catch {};
 
@@ -207,7 +197,7 @@ test "emptyDir removes file contents" {
     {
         const dir = try cwd.openDir(io, fixture_root, .{});
         defer dir.close(io);
-        var file = try dir.createFile(io, file_rel, .{});
+        var file = try dir.createFile(io, ".zig-cache/file.txt", .{});
         defer file.close(io);
         try file.writeStreamingAll(io, "hello");
     }
@@ -217,14 +207,12 @@ test "emptyDir removes file contents" {
         try emptyDir(io, dir, artifact_rel);
     }
 
-    // Directory should still exist but be empty.
     const dir_after = try cwd.openDir(io, fixture_root, .{});
     defer dir_after.close(io);
     const sub = try dir_after.openDir(io, artifact_rel, .{ .iterate = true });
     defer sub.close(io);
     var iter = sub.iterate();
-    const first = try iter.next(io);
-    try std.testing.expect(first == null);
+    try std.testing.expect(try iter.next(io) == null);
 
     cwd.deleteTree(io, fixture_root) catch {};
 }

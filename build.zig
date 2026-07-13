@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
         "src/cleaner.zig",
         "src/format.zig",
         "src/interactive.zig",
+        "src/path_util.zig",
         "src/scanner.zig",
         "src/selection.zig",
     };
