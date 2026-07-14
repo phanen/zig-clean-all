@@ -1,6 +1,7 @@
 //! Path normalisation helpers for user-supplied paths.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const path = std.fs.path;
 const Allocator = std.mem.Allocator;
 
@@ -16,11 +17,13 @@ pub fn resolvePaths(
     return try list.toOwnedSlice(backing);
 }
 
-/// True when `p` equals or is nested inside one of `roots`. Compared as
-/// path strings; callers are expected to have resolved and normalised each
-/// root up front.
+/// True when `p` equals or is nested inside one of `roots`. Both must be
+/// non-empty and normalised (no trailing sep)
 pub fn pathIsUnderAny(p: []const u8, roots: []const []const u8) bool {
+    assert(p.len > 0);
     for (roots) |root| {
+        assert(root.len > 0);
+        assert(root[root.len - 1] != path.sep);
         if (p.len >= root.len and
             std.mem.eql(u8, p[0..root.len], root) and
             (p.len == root.len or p[root.len] == path.sep)) return true;

@@ -237,7 +237,7 @@ fn analyzeAndAppend(
     ctx.shards[worker_id].append(ctx.arena, .{
         .project = .{ .path = project_abs },
         .analysis = analysis,
-    }) catch return;
+    }) catch @panic("OOM");
 }
 
 fn recordFailure(
@@ -253,7 +253,7 @@ fn recordFailure(
         .fn_name = src.fn_name,
         .line = src.line,
         .err = err,
-    }) catch {};
+    }) catch @panic("OOM");
 }
 
 fn shouldSkipDescend(basename: []const u8) bool {

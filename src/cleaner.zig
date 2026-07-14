@@ -121,7 +121,6 @@ fn emptyDir(io: Io, parent: Dir, name: []const u8) anyerror!void {
         error.FileNotFound => return,
         else => return err,
     };
-    errdefer initial.close(io);
 
     var stack_buffer: [16]StackItem = undefined;
     var stack = std.ArrayList(StackItem).initBuffer(&stack_buffer);
